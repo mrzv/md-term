@@ -30,9 +30,8 @@ pub struct Document {
 }
 
 pub struct Raster {
-    pub png: Vec<u8>,
+    pub pixels: tiny_skia::Pixmap,
     pub render_elapsed: Duration,
-    pub encode_elapsed: Duration,
 }
 
 impl Document {
@@ -62,14 +61,9 @@ impl Document {
             tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, -(x as f32), -(y as f32));
         resvg::render(&self.tree, transform, &mut pixels.as_mut());
         let render_elapsed = render_started.elapsed();
-        let encode_started = Instant::now();
-        let png = pixels
-            .encode_png()
-            .context("cannot encode document viewport")?;
         Ok(Raster {
-            png,
+            pixels,
             render_elapsed,
-            encode_elapsed: encode_started.elapsed(),
         })
     }
 }
@@ -241,13 +235,17 @@ pub fn export(path: &Path, output: &Path, options: RenderOptions) -> Result<()> 
     let document = render(path, options)?;
     let (width, height) = document.dimensions(ppi);
     let raster = document.rasterize(ppi, 0, 0, width, height)?;
+    let png = raster
+        .pixels
+        .encode_png()
+        .context("cannot encode exported PNG")?;
     let mut destination = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(output)
         .with_context(|| format!("cannot create export {}", output.display()))?;
     let written = (|| -> io::Result<()> {
-        destination.write_all(&raster.png)?;
+        destination.write_all(&png)?;
         destination.sync_all()
     })();
     if let Err(error) = written {
@@ -632,9 +630,10 @@ mod tests {
         assert_eq!(document.dimensions(72), (72, 144));
         assert_eq!(document.dimensions(144), (144, 288));
         let raster = document.rasterize(144, 36, 144, 36, 36).unwrap();
-        let pixels = image::load_from_memory(&raster.png).unwrap().to_rgba8();
-        assert_eq!(pixels.dimensions(), (36, 36));
-        assert_eq!(pixels.get_pixel(18, 18).0, [255, 0, 0, 255]);
+        assert_eq!((raster.pixels.width(), raster.pixels.height()), (36, 36));
+        assert_eq!(raster.pixels.pixel(18, 18).unwrap().demultiply().red(), 255);
+        assert_eq!(raster.pixels.pixel(18, 18).unwrap().demultiply().green(), 0);
+        assert_eq!(raster.pixels.pixel(18, 18).unwrap().alpha(), 255);
         assert!(document.rasterize(144, 144, 0, 1, 1).is_err());
         assert!(document.rasterize(0, 0, 0, 1, 1).is_err());
     }
@@ -672,10 +671,24 @@ mod tests {
                 let raster = document
                     .rasterize(ppi, 8 * scale, y * scale / 3, 24 * scale, 24 * scale)
                     .unwrap();
-                let pixels = image::load_from_memory(&raster.png).unwrap().to_rgba8();
-                assert_eq!(pixels.dimensions(), (24 * scale, 24 * scale));
-                assert_eq!(pixels.get_pixel(scale, scale).0, [255, 0, 0, 255]);
-                assert_eq!(pixels.get_pixel(12 * scale, 12 * scale).0, [0, 255, 0, 255]);
+                assert_eq!(
+                    (raster.pixels.width(), raster.pixels.height()),
+                    (24 * scale, 24 * scale)
+                );
+                let red = raster.pixels.pixel(scale, scale).unwrap().demultiply();
+                let green = raster
+                    .pixels
+                    .pixel(12 * scale, 12 * scale)
+                    .unwrap()
+                    .demultiply();
+                assert_eq!(
+                    [red.red(), red.green(), red.blue(), red.alpha()],
+                    [255, 0, 0, 255]
+                );
+                assert_eq!(
+                    [green.red(), green.green(), green.blue(), green.alpha()],
+                    [0, 255, 0, 255]
+                );
             }
         }
     }

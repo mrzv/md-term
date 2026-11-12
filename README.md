@@ -63,7 +63,7 @@ In lists, `j`/`k` or arrows select, Enter activates, and `/` starts a case-insen
 
 The active file is checked for changes every 750 ms. Failed reloads retain the previous rendering; edit again or press `r` to retry. A successful reload closes an open outline to discard stale heading selections. Theme changes and reloads re-typeset synchronously; zoom resamples the cached vector canvas without rerunning Pandoc or Typst. Inactive tabs reload when activated.
 
-Smooth scrolling follows `pdfterm`'s 16 ms eased steps, with immediate reversal and no queued animation backlog. Jumps, search, tab changes, and modal panes cancel unfinished movement. Nearby scrolling reuses a raster bounded to the viewport width and up to three viewport heights, capped at 10,000 pixels high for Kitty/Ghostty compatibility; distant movement replaces it without first deleting the visible image.
+Smooth scrolling follows `pdfterm`'s 16 ms eased steps, with immediate reversal and no queued animation backlog. Jumps, search, tab changes, and modal panes cancel unfinished movement. Nearby scrolling reuses a raster up to three viewport heights, capped at 10,000 pixels high and a 4,194,304-pixel overscan budget. Large viewports are split into horizontal image bands, each at most 16 MiB of decoded RGBA, so relays such as Herdr do not drop an oversized graphics frame. Replacements are placed before the previous image bands are deleted.
 
 The status line shows measured frame work and a `cache` indicator. Press `p` for SVG rendering, PNG/base64 encoding, and terminal-output/flush timings. Cached movements skip rendering and encoding. These measurements describe application work, not terminal-emulator display latency.
 

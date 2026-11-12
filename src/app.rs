@@ -126,11 +126,16 @@ struct FrameKey {
 
 impl FrameKey {
     fn region(position: Position, width: u32, height: u32, ppi: u32, view: Viewport) -> Self {
+        let region_width = view.width.min(width.saturating_sub(position.x));
+        // Keep decoded relay assets small, not merely their compressed PNGs.
+        // A viewport larger than this budget is split into transport tiles.
+        let cache_height = (graphics::MAX_IMAGE_PIXELS / region_width.max(1)).max(view.height);
         let region_height = view
             .height
             .saturating_mul(3)
             .min(height)
-            .min(graphics::MAX_IMAGE_DIMENSION);
+            .min(graphics::MAX_IMAGE_DIMENSION)
+            .min(cache_height);
         Self {
             position: Position {
                 x: position.x,
@@ -139,7 +144,7 @@ impl FrameKey {
                     .saturating_sub(region_height.saturating_sub(view.height) / 2)
                     .min(height.saturating_sub(region_height)),
             },
-            width: view.width.min(width.saturating_sub(position.x)),
+            width: region_width,
             height: region_height,
             ppi,
             viewport_width: view.width,
@@ -242,10 +247,9 @@ impl Tab {
                 key.height,
             )?;
             performance.render = raster.render_elapsed;
-            performance.encode = raster.encode_elapsed;
             let encode_started = Instant::now();
-            let frame = Frame::from_png(raster.png)?;
-            performance.encode += encode_started.elapsed();
+            let frame = Frame::from_pixels(raster.pixels)?;
+            performance.encode = encode_started.elapsed();
             self.frame = Some((key, frame));
         } else {
             performance.cache_hit = true;
@@ -1877,8 +1881,15 @@ mod tests {
 
     #[test]
     fn high_zoom_overscan_respects_terminal_limit_without_losing_visible_region() {
-        for viewport_height in [4000, 6000, 10000] {
+        for (viewport_width, viewport_height) in [
+            (800, 4000),
+            (800, 6000),
+            (800, 10000),
+            (2000, 1972),
+            (2400, 2400),
+        ] {
             let view = Viewport {
+                width: viewport_width,
                 height: viewport_height,
                 ..scroll_view()
             };
@@ -1886,8 +1897,13 @@ mod tests {
                 let maximum = height.saturating_sub(view.height);
                 for y in [0, maximum / 2, maximum] {
                     let position = Position { x: 0, y };
-                    let key = FrameKey::region(position, 2000, height, 240, view);
-                    assert_eq!(key.height, height.min(graphics::MAX_IMAGE_DIMENSION));
+                    let key = FrameKey::region(position, 2400, height, 240, view);
+                    assert!(key.height <= graphics::MAX_IMAGE_DIMENSION);
+                    assert!(
+                        key.width * key.height <= graphics::MAX_IMAGE_PIXELS
+                            || key.height == height.min(view.height),
+                        "overscan exceeded the decoded pixel budget"
+                    );
                     assert!(key.position.y + key.height <= height);
                     assert!(key.contains(position, height, 240, view));
                 }
