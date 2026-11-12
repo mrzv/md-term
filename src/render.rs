@@ -30,6 +30,18 @@ pub struct Entry {
     pub id: Option<String>,
 }
 
+struct LinkRegion {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+struct Link {
+    target: String,
+    regions: Vec<LinkRegion>,
+}
+
 pub enum Source {
     File(PathBuf),
     Stdin {
@@ -86,6 +98,7 @@ impl Source {
 pub struct Document {
     pub source: Arc<Source>,
     pub entries: Vec<Entry>,
+    links: Vec<Link>,
     tree: usvg::Tree,
 }
 
@@ -95,6 +108,30 @@ pub struct Raster {
 }
 
 impl Document {
+    /// Hit-test a terminal cell expressed in document points.
+    pub fn link_at(&self, cell: [f64; 4]) -> Option<&str> {
+        let [x, y, width, height] = cell;
+        let right = (x + width).min(f64::from(self.tree.size().width()));
+        let bottom = (y + height).min(f64::from(self.tree.size().height()));
+        if right <= x || bottom <= y {
+            return None;
+        }
+        self.links
+            .iter()
+            .flat_map(|link| link.regions.iter().map(move |region| (link, region)))
+            .filter(|(_, region)| {
+                region.left < right && region.right > x && region.top < bottom && region.bottom > y
+            })
+            .min_by(|(_, a), (_, b)| {
+                let distance = |region: &LinkRegion| {
+                    (region.left + region.right - x - right).powi(2)
+                        + (region.top + region.bottom - y - bottom).powi(2)
+                };
+                distance(a).total_cmp(&distance(b))
+            })
+            .map(|(link, _)| link.target.as_str())
+    }
+
     pub fn dimensions(&self, ppi: u32) -> (u32, u32) {
         let scale = f64::from(ppi) / 72.0;
         (
@@ -218,8 +255,10 @@ pub fn render(source: Arc<Source>, options: RenderOptions) -> Result<Document> {
         base: source.directory(),
         work: work.path(),
         images: HashMap::new(),
+        links: Vec::new(),
     };
     sanitizer.walk(blocks)?;
+    let mut links = sanitizer.links;
     if blocks.as_array().is_some_and(Vec::is_empty) {
         *blocks = json!([raw_block("#box(width: 0pt, height: 0pt)")]);
     }
@@ -276,11 +315,12 @@ pub fn render(source: Arc<Source>, options: RenderOptions) -> Result<Document> {
         resources_dir: Some(work.path().to_owned()),
         ..usvg::Options::default()
     };
-    let tree = usvg::Tree::from_data(
-        &fs::read(&svg_path).context("cannot read generated document SVG")?,
-        &svg_options,
-    )
-    .context("cannot parse generated document SVG")?;
+    let svg_source = fs::read_to_string(&svg_path).context("cannot read generated document SVG")?;
+    let svg = usvg::roxmltree::Document::parse(&svg_source)
+        .context("cannot parse generated document SVG")?;
+    let tree = usvg::Tree::from_xmltree(&svg, &svg_options)
+        .context("cannot parse generated document SVG")?;
+    locate_links(&svg, &mut links)?;
     let query = run(
         Command::new("typst")
             .arg("query")
@@ -295,6 +335,7 @@ pub fn render(source: Arc<Source>, options: RenderOptions) -> Result<Document> {
     Ok(Document {
         source,
         entries,
+        links,
         tree,
     })
 }
@@ -383,6 +424,7 @@ struct Sanitizer<'a> {
     base: &'a Path,
     work: &'a Path,
     images: HashMap<PathBuf, String>,
+    links: Vec<Link>,
 }
 
 impl Sanitizer<'_> {
@@ -475,15 +517,21 @@ impl Sanitizer<'_> {
                 }
             }
             "Link" => {
+                // Opaque SVG destinations keep source URLs out of XML attributes.
                 let mut inlines = node["c"][1].as_array().cloned().unwrap_or_default();
                 inlines.insert(
                     0,
                     raw_inline(&format!(
-                        "{}#md-color(md-link)[",
-                        marker(&text, None, target.as_deref(), None)
+                        "{}#md-color(md-link)[#link(\"mdterm:{}\")[",
+                        marker(&text, None, target.as_deref(), None),
+                        self.links.len(),
                     )),
                 );
-                inlines.push(raw_inline("]"));
+                inlines.push(raw_inline("]]"));
+                self.links.push(Link {
+                    target: target.unwrap_or_default(),
+                    regions: Vec::new(),
+                });
                 *node = json!({"t": "Span", "c": [["", [], []], inlines]});
             }
             "Header" | "Plain" | "Para" => {
@@ -666,6 +714,83 @@ fn percent_decode(input: &str) -> Result<String> {
     String::from_utf8(decoded).context("image URL is not UTF-8")
 }
 
+fn locate_links(svg: &usvg::roxmltree::Document<'_>, links: &mut [Link]) -> Result<()> {
+    for node in svg.descendants().filter(|node| node.has_tag_name("a")) {
+        let Some(index) = node
+            .attribute("href")
+            .or_else(|| node.attribute(("http://www.w3.org/1999/xlink", "href")))
+            .and_then(|href| href.strip_prefix("mdterm:"))
+        else {
+            continue;
+        };
+        let link = links
+            .get_mut(
+                index
+                    .parse::<usize>()
+                    .context("invalid SVG link identifier")?,
+            )
+            .context("unknown SVG link identifier")?;
+        for rect in node.descendants().filter(|node| node.has_tag_name("rect")) {
+            let number = |name| -> Result<f64> {
+                rect.attribute(name)
+                    .unwrap_or("0")
+                    .parse()
+                    .context("invalid SVG link bounds")
+            };
+            let (x, y, width, height) = (
+                number("x")?,
+                number("y")?,
+                number("width")?,
+                number("height")?,
+            );
+            if width <= 0.0 || height <= 0.0 {
+                continue;
+            }
+            let mut corners = [
+                (x, y),
+                (x + width, y),
+                (x, y + height),
+                (x + width, y + height),
+            ];
+            for ancestor in rect.ancestors() {
+                if let Some(transform) = ancestor.attribute("transform") {
+                    let transform: svgtypes::Transform =
+                        transform.parse().context("invalid SVG link transform")?;
+                    for (x, y) in &mut corners {
+                        (*x, *y) = (
+                            transform.a * *x + transform.c * *y + transform.e,
+                            transform.b * *x + transform.d * *y + transform.f,
+                        );
+                    }
+                }
+            }
+            ensure!(
+                corners.iter().all(|(x, y)| x.is_finite() && y.is_finite()),
+                "SVG link has invalid coordinates"
+            );
+            link.regions.push(LinkRegion {
+                left: corners
+                    .iter()
+                    .map(|(x, _)| *x)
+                    .fold(f64::INFINITY, f64::min),
+                top: corners
+                    .iter()
+                    .map(|(_, y)| *y)
+                    .fold(f64::INFINITY, f64::min),
+                right: corners
+                    .iter()
+                    .map(|(x, _)| *x)
+                    .fold(f64::NEG_INFINITY, f64::max),
+                bottom: corners
+                    .iter()
+                    .map(|(_, y)| *y)
+                    .fold(f64::NEG_INFINITY, f64::max),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn parse_entries(query: &[u8]) -> Result<Vec<Entry>> {
     #[derive(Deserialize)]
     struct LocatedEntry {
@@ -700,6 +825,56 @@ fn parse_entries(query: &[u8]) -> Result<Vec<Entry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_regions_follow_wrapping_transforms_and_adjacent_cell_targets() {
+        let svg = usvg::roxmltree::Document::parse(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="70">
+<g transform="translate(20 30)">
+  <a href="mdterm:0" transform="scale(2)">
+    <rect x="1" y="2" width="10" height="4"/>
+    <rect x="1" y="12" width="10" height="4"/>
+  </a>
+  <a xlink:href="mdterm:1" transform="translate(22 4)"><rect width="10" height="8"/></a>
+</g>
+<a href="mdterm:1" transform="translate(190 20)"><rect width="40" height="8"/></a>
+</svg>"#,
+        )
+        .unwrap();
+        let mut links = vec![
+            Link {
+                target: "https://example.com?a=1&b=2".into(),
+                regions: Vec::new(),
+            },
+            Link {
+                target: "#other".into(),
+                regions: Vec::new(),
+            },
+        ];
+        locate_links(&svg, &mut links).unwrap();
+        let document = Document {
+            source: Arc::new(Source::File(PathBuf::new())),
+            entries: Vec::new(),
+            links,
+            tree: usvg::Tree::from_xmltree(&svg, &usvg::Options::default()).unwrap(),
+        };
+        assert_eq!(
+            document.link_at([23.0, 35.0, 1.0, 1.0]),
+            Some("https://example.com?a=1&b=2")
+        );
+        assert_eq!(
+            document.link_at([23.0, 55.0, 1.0, 1.0]),
+            Some("https://example.com?a=1&b=2")
+        );
+        assert_eq!(document.link_at([23.0, 44.0, 1.0, 1.0]), None);
+        assert_eq!(document.link_at([41.0, 35.0, 4.0, 1.0]), Some("#other"));
+        // A tiny link remains clickable when it touches only a cell's corner.
+        assert_eq!(
+            document.link_at([21.9, 33.9, 0.2, 0.2]),
+            Some("https://example.com?a=1&b=2")
+        );
+        assert_eq!(document.link_at([205.0, 21.0, 1.0, 1.0]), None);
+    }
 
     #[test]
     fn typst_strings_cannot_escape_into_code() {
@@ -741,6 +916,7 @@ mod tests {
         let document = Document {
             source: Arc::new(Source::File(PathBuf::new())),
             entries: Vec::new(),
+            links: Vec::new(),
             tree,
         };
         assert_eq!(document.dimensions(72), (72, 144));
@@ -781,6 +957,7 @@ mod tests {
         let document = Document {
             source: Arc::new(Source::File(PathBuf::new())),
             entries: Vec::new(),
+            links: Vec::new(),
             tree,
         };
         // Visit far-apart regions and then jump back, at native, startup, and
@@ -821,6 +998,7 @@ mod tests {
             base: work.path(),
             work: work.path(),
             images: HashMap::new(),
+            links: Vec::new(),
         };
         let mut ast = json!([
             {"t":"Header", "c":[1,["anchor",["typst:no-figure"],[["typst:fill", "panic(\"injected\")"]]],[{"t":"Str","c":"Title"}]]},
@@ -840,6 +1018,7 @@ mod tests {
             base: base.path(),
             work: work.path(),
             images: HashMap::new(),
+            links: Vec::new(),
         };
         let first = sanitizer
             .stage_image("%E9%9B%AA%20%231.png")

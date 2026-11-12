@@ -15,7 +15,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use crossterm::{
     cursor::MoveTo,
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind},
+    event::{
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    },
     queue,
     style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{Clear, ClearType},
@@ -638,6 +640,23 @@ impl App {
             Action::Directory(path) => self.browse(&path)?,
         }
         Ok(())
+    }
+
+    fn click(&mut self, column: u16, row: u16, view: Viewport) -> Result<bool> {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return Ok(false);
+        };
+        let Some(cell) = self.cache.document_cell(tab.generation, column, row, view) else {
+            return Ok(false);
+        };
+        let document = Arc::clone(&tab.document);
+        let Some(target) = document.link_at(cell) else {
+            return Ok(false);
+        };
+        self.scroll.cancel();
+        self.message.clear();
+        self.follow(target)?;
+        Ok(true)
     }
 
     fn key(&mut self, key: KeyEvent, view: Viewport) -> Result<bool> {
@@ -1313,6 +1332,7 @@ const HELP_NAVIGATION: &[(&str, &str)] = &[
     ("n / N", "Next / previous match"),
     ("t", "Heading outline"),
     ("Enter / L", "Browse links"),
+    ("Left click", "Follow a rendered link"),
     ("b / B", "Back / forward"),
     ("Tab / Shift-Tab", "Switch tabs"),
     ("Alt-1 … Alt-9", "Select tab"),
@@ -1716,12 +1736,16 @@ pub fn run(sources: Vec<Arc<Source>>, options: RenderOptions) -> Result<()> {
                     Ok(true)
                 }
                 Event::Mouse(mouse) if matches!(app.mode, Mode::Normal) => {
-                    let delta = match mouse.kind {
-                        MouseEventKind::ScrollDown => 48,
-                        MouseEventKind::ScrollUp => -48,
-                        _ => 0,
-                    };
-                    Ok(delta != 0 && app.scroll_vertical(delta, view))
+                    if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                        app.click(mouse.column, mouse.row, view)
+                    } else {
+                        let delta = match mouse.kind {
+                            MouseEventKind::ScrollDown => 48,
+                            MouseEventKind::ScrollUp => -48,
+                            _ => 0,
+                        };
+                        Ok(delta != 0 && app.scroll_vertical(delta, view))
+                    }
                 }
                 _ => Ok(false),
             };

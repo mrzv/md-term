@@ -62,6 +62,15 @@ impl StripKey {
 }
 
 impl ContextKey {
+    fn origin(&self) -> (u32, u32) {
+        (
+            (self.viewport_width.saturating_sub(self.width) / 2) / self.cell_width
+                * self.cell_width,
+            (self.viewport_height.saturating_sub(self.height) / 2) / self.cell_height
+                * self.cell_height,
+        )
+    }
+
     fn cell_aligned(&self) -> bool {
         self.row_limit() <= (self.cell_height - 1) * 2
     }
@@ -525,6 +534,39 @@ impl StripCache {
         })
     }
 
+    /// Only map clicks once the active document's requested view is actually displayed.
+    pub fn document_cell(
+        &self,
+        generation: u64,
+        column: u16,
+        row: u16,
+        view: Viewport,
+    ) -> Option<[f64; 4]> {
+        let context = self.context?;
+        if context.generation != generation
+            || self.displayed_position != Some((context, self.y))
+            || context.viewport_width != view.width
+            || context.viewport_height != view.height
+            || column >= view.columns
+            || row >= view.rows - 1
+        {
+            return None;
+        }
+        let (left, top) = context.origin();
+        let x = (u32::from(column) * context.cell_width).checked_sub(left)?;
+        let y = (u32::from(row.checked_sub(view.top)?) * context.cell_height).checked_sub(top)?;
+        if x >= context.width || y >= context.height.saturating_sub(self.y) {
+            return None;
+        }
+        let scale = 72.0 / f64::from(context.ppi);
+        Some([
+            f64::from(context.x + x) * scale,
+            f64::from(self.y + y) * scale,
+            f64::from(context.cell_width) * scale,
+            f64::from(context.cell_height) * scale,
+        ])
+    }
+
     pub fn place(&mut self, out: &mut impl Write, view: Viewport) -> Result<bool> {
         let Some(context) = self.context else {
             return Ok(false);
@@ -533,10 +575,8 @@ impl StripCache {
             return Ok(false);
         }
         self.placement_ids.clear();
-        let cell_width = view.width / u32::from(view.columns);
         let cell_height = context.cell_height;
-        let left = (view.width.saturating_sub(context.width) / 2) / cell_width * cell_width;
-        let top = (view.height.saturating_sub(context.height) / 2) / cell_height * cell_height;
+        let (left, top) = context.origin();
         for key in &self.desired[..self.visible] {
             let resident = self
                 .residents
@@ -621,6 +661,63 @@ mod tests {
             frame: Frame::from_pixels(pixels).unwrap(),
             uploaded: false,
         }
+    }
+
+    #[test]
+    fn link_cells_follow_centering_scroll_zoom_and_displayed_generation() {
+        let view = Viewport {
+            columns: 80,
+            rows: 26,
+            top: 1,
+            width: 800,
+            height: 480,
+        };
+        let centered = ContextKey {
+            cell_width: 10,
+            cell_height: 20,
+            viewport_width: view.width,
+            ..context(400, 200, view.height)
+        };
+        let mut cache = StripCache::new(|| {}).unwrap();
+        cache.context = Some(centered);
+        cache.displayed_position = Some((centered, 0));
+        assert_eq!(
+            cache.document_cell(1, 20, 8, view),
+            Some([0.0, 0.0, 3.0, 6.0])
+        );
+        for (column, row) in [(19, 8), (60, 8), (20, 7), (20, 18), (20, 0), (20, 25)] {
+            assert_eq!(cache.document_cell(1, column, row, view), None);
+        }
+
+        let scrolled = ContextKey {
+            generation: 2,
+            ppi: 576,
+            x: 83,
+            width: view.width,
+            height: 30_000,
+            ..centered
+        };
+        cache.context = Some(scrolled);
+        cache.y = 257;
+        cache.displayed_position = Some((scrolled, 257));
+        assert_eq!(
+            cache.document_cell(2, 3, 2, view),
+            Some([14.125, 34.625, 1.25, 2.5])
+        );
+        assert_eq!(cache.document_cell(1, 3, 2, view), None);
+        assert_eq!(
+            cache.document_cell(2, 3, 2, Viewport { width: 810, ..view }),
+            None
+        );
+        // A cold jump or replacement rendering must not activate unseen links.
+        cache.y = 258;
+        assert_eq!(cache.document_cell(2, 3, 2, view), None);
+        cache.y = 257;
+        cache.context = Some(ContextKey {
+            generation: 3,
+            ..scrolled
+        });
+        assert_eq!(cache.document_cell(3, 3, 2, view), None);
     }
 
     #[test]

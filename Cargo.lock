@@ -461,6 +461,7 @@ dependencies = [
  "resvg",
  "serde",
  "serde_json",
+ "svgtypes",
  "tempfile",
  "toml",
  "unicode-width",

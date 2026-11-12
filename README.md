@@ -53,6 +53,7 @@ With no file arguments, piped stdin is read through EOF. Use `-` to select stdin
 | `n` / `N` | Next / previous matching text block |
 | `t` | Heading outline |
 | Enter / `L` | Browse document links |
+| Left click | Follow a rendered document link |
 | `b` / `B` | Back / forward navigation history |
 | `+` / `-` / `0` | Zoom in / out / reset to startup resolution |
 | `m` | Toggle fit-width / original resolution |
@@ -123,7 +124,7 @@ Set `[markup] enabled = false` to disable markup colors while preserving bold, i
 - Search, outline, and heading-fragment navigation jump to text-block coordinates; matches are not highlighted.
 - Zoom changes raster resolution, not document layout. Keyboard zoom and fit-width share the 36–576 PPI range (up to 600%).
 - Local images are copied into a private rendering directory. Relative paths use the source file's directory, or the working directory for stdin. Remote/data images are not fetched and become descriptive text.
-- Local Markdown links (including heading fragments) open in new tabs. Heading fragments within the current document stay in that tab. Explicitly selected HTTP(S)/mailto links use the system opener. Other schemes and non-Markdown file links are rejected.
+- Local Markdown links (including heading fragments) open in new tabs. Heading fragments within the current document stay in that tab. HTTP(S)/mailto links use the system opener only when clicked or explicitly selected from the link list. Other schemes and non-Markdown file links are rejected.
 - Source metadata, raw HTML, and styling attributes are not used as executable layout instructions. Code-fence language tags reach the highlighter only as quoted text; other code attributes are discarded. Raw Typst/TeX blocks are displayed as inert code. Unsupported math follows Pandoc's conversion behavior.
 - Private rendering files are removed after layout; the cached vector document stays in memory. A stdin snapshot is removed when its tab closes and pending rendering releases it. Exported PNGs are retained.
 - Terminal pixel dimensions come from the terminal window size; when unavailable, the viewer assumes 8×16-pixel cells.
