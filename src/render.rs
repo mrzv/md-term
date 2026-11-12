@@ -162,7 +162,7 @@ const PREAMBLE: &str = r##"
     level: level, target: target, id: id,
   )) <mdterm-entry>]
 }
-#let md-code(text) = {
+#let md-code(text, lang) = {
   show raw.where(block: true): it => context {
     let position = it.location().position()
     [
@@ -173,7 +173,7 @@ const PREAMBLE: &str = r##"
       #it
     ]
   }
-  raw(text, block: true)
+  raw(text, block: true, lang: lang, theme: "code.tmTheme")
 }
 "##;
 
@@ -218,13 +218,14 @@ pub fn render(source: Arc<Source>, options: RenderOptions) -> Result<Document> {
         Command::new("pandoc")
             .arg("--from=json")
             .arg("--to=typst")
-            .arg("--no-highlight")
             .arg("--wrap=none")
             .arg("--")
             .arg(&ast_path),
         "converting sanitized Markdown to Typst",
     )?;
     let body = String::from_utf8(body).context("Pandoc emitted non-UTF-8 Typst")?;
+    fs::write(work.path().join("code.tmTheme"), code_theme(options.dark))
+        .context("cannot write syntax highlighting theme")?;
     let palette = if options.dark {
         ["#1e2030", "#c8d3f5", "#222436", "#636da6", "#82aaff"]
     } else {
@@ -333,6 +334,39 @@ fn run(command: &mut Command, stage: &str) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+fn code_theme(dark: bool) -> String {
+    let [comment, keyword, string, constant, entity, function] = if dark {
+        [
+            "#828bb8", "#c099ff", "#c3e88d", "#ff966c", "#86e1fc", "#82aaff",
+        ]
+    } else {
+        [
+            "#6e7781", "#cf222e", "#0a3069", "#0550ae", "#953800", "#8250df",
+        ]
+    };
+    format!(
+        r##"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>name</key><string>mdterm</string>
+<key>settings</key><array>
+<dict><key>settings</key><dict/></dict>
+<dict><key>scope</key><string>comment</string>
+<key>settings</key><dict><key>foreground</key><string>{comment}</string></dict></dict>
+<dict><key>scope</key><string>keyword, storage</string>
+<key>settings</key><dict><key>foreground</key><string>{keyword}</string></dict></dict>
+<dict><key>scope</key><string>string</string>
+<key>settings</key><dict><key>foreground</key><string>{string}</string></dict></dict>
+<dict><key>scope</key><string>constant</string>
+<key>settings</key><dict><key>foreground</key><string>{constant}</string></dict></dict>
+<dict><key>scope</key><string>entity.name, entity.other.attribute-name, support</string>
+<key>settings</key><dict><key>foreground</key><string>{entity}</string></dict></dict>
+<dict><key>scope</key><string>entity.name.function, support.function</string>
+<key>settings</key><dict><key>foreground</key><string>{function}</string></dict></dict>
+</array></dict></plist>
+"##
+    )
+}
+
 struct Sanitizer<'a> {
     base: &'a Path,
     work: &'a Path,
@@ -366,6 +400,17 @@ impl Sanitizer<'_> {
             };
         }
         let kind = node["t"].as_str().unwrap_or_default().to_owned();
+        if kind == "CodeBlock" {
+            // Only quoted text and a language tag reach Typst, never writer attributes.
+            let code = node["c"][1].as_str().unwrap_or_default();
+            let lang = node["c"][0][1][0].as_str();
+            *node = raw_block(&format!(
+                "#md-code({}, {})",
+                typst_string(code),
+                lang.map_or_else(|| "none".to_owned(), typst_string),
+            ));
+            return Ok(());
+        }
         if kind == "DefinitionList" {
             if let Some(items) = node["c"].as_array_mut() {
                 for item in items {
@@ -382,7 +427,7 @@ impl Sanitizer<'_> {
         }
         let searchable = matches!(
             kind.as_str(),
-            "Plain" | "Para" | "Header" | "Link" | "CodeBlock" | "LineBlock"
+            "Plain" | "Para" | "Header" | "Link" | "LineBlock"
         );
         let text = if searchable {
             plain_text(node)
@@ -440,10 +485,6 @@ impl Sanitizer<'_> {
                         inlines.insert(0, raw_inline(&marker(&text, level, None, id.as_deref())));
                     }
                 }
-            }
-            "CodeBlock" => {
-                let code = node["c"][1].as_str().unwrap_or_default();
-                *node = raw_block(&format!("#md-code({})", typst_string(code)));
             }
             "LineBlock" => {
                 if let Some(first) = node["c"]
