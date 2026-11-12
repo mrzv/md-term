@@ -24,10 +24,16 @@ Typst uses installed fonts and its bundled Latin/math fonts. Install a CJK font 
 mdterm README.md
 mdterm first.md second.md       # separate tabs
 mdterm                         # browse current directory
+cat README.md | mdterm          # read piped Markdown
+mdterm - < README.md            # explicitly select stdin
+mdterm notes.md - < README.md   # mix file and stdin tabs
 mdterm --light book.md
 mdterm --ppi 120 book.md
 mdterm --export document.png README.md
+cat README.md | mdterm --export stdin.png
 ```
+
+With no file arguments, piped stdin is read through EOF. Use `-` to select stdin explicitly, at most once. Keyboard controls still use the controlling terminal. Stdin opens as a private snapshot named `stdin`; relative images and Markdown links resolve from the working directory.
 
 `--export` renders the entire continuous document without a terminal and refuses to overwrite an existing file. It requires exactly one input and allocates a full-document bitmap, unlike interactive viewing. `--ppi` accepts 36–288 (default 240, or 250% zoom; 96 PPI is 100%). Dark rendering is the default.
 
@@ -61,7 +67,7 @@ mdterm --export document.png README.md
 
 In lists, `j`/`k` or arrows select, Enter activates, and `/` starts a case-insensitive filter. `o` enters a file path. Hidden files/directories are omitted from the browser; paths can still be opened explicitly. The browser recognizes `.md`, `.markdown`, `.mdown`, `.mkd`, and `.mdx` (MDX is treated as Markdown, not executed).
 
-The active file is checked for changes every 750 ms. Failed reloads retain the previous rendering; edit again or press `r` to retry. A successful reload closes an open outline to discard stale heading selections. Theme changes and reloads re-typeset synchronously; zoom resamples the cached vector canvas without rerunning Pandoc or Typst. Inactive tabs reload when activated.
+The active file is checked for changes every 750 ms. Stdin is not watched; manual reloads and theme changes reuse its captured contents. Failed reloads retain the previous rendering; edit again or press `r` to retry. A successful reload closes an open outline to discard stale heading selections. Theme changes and reloads re-typeset synchronously; zoom resamples the cached vector canvas without rerunning Pandoc or Typst. Inactive file tabs reload when activated.
 
 Smooth scrolling follows `pdfterm`'s 16 ms eased steps, with immediate reversal and no queued animation backlog. Jumps, search, tab changes, and modal panes cancel unfinished movement. A single background worker rasterizes and encodes reusable strips, targeting 256 logical rows and 1,048,576 pixels per image. Cell-sized raster bleed and transparent edge padding let adjacent strips occupy exclusive whole-cell rectangles without scaling or overlap, including through Herdr. Scroll positions remain pixel-exact. Each image stays within the 4,194,304-pixel transport limit (16 MiB decoded RGBA).
 
@@ -77,9 +83,9 @@ Use `$E = mc^2$` for inline math and `$$...$$` on separate lines for display mat
 
 - Search, outline, and heading-fragment navigation jump to text-block coordinates; matches are not highlighted.
 - Zoom changes raster resolution, not document layout. Fit-width is bounded by the 36–288 PPI range.
-- Local image paths resolve relative to the Markdown file and are copied into a private rendering directory. Remote/data images are not fetched and become descriptive text.
+- Local images are copied into a private rendering directory. Relative paths use the source file's directory, or the working directory for stdin. Remote/data images are not fetched and become descriptive text.
 - Local Markdown links (including heading fragments) open in new tabs. Heading fragments within the current document stay in that tab. Explicitly selected HTTP(S)/mailto links use the system opener. Other schemes and non-Markdown file links are rejected.
 - Source metadata, raw HTML, and styling attributes are not used as executable layout instructions. Raw Typst/TeX blocks are displayed as code. Unsupported math follows Pandoc's conversion behavior. Code blocks are monospaced without syntax highlighting.
-- Private rendering files are removed after layout; the cached vector document stays in memory. Exported PNGs are retained.
+- Private rendering files are removed after layout; the cached vector document stays in memory. A stdin snapshot is removed when its tab closes and pending rendering releases it. Exported PNGs are retained.
 - Terminal pixel dimensions come from the terminal window size; when unavailable, the viewer assumes 8×16-pixel cells.
 - Drawable terminal heights and cell widths above 10,000 pixels, or individual cells above 4,194,304 pixels, exceed the graphics transport limits and are rejected.

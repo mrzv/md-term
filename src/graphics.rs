@@ -91,9 +91,10 @@ impl TerminalGuard {
         if std::env::var_os("TMUX").is_some() {
             bail!("Kitty graphics inside tmux are not supported; run md-term outside tmux");
         }
-        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-            bail!("interactive viewing requires a terminal; use --export for PNG output");
+        if !io::stdout().is_terminal() {
+            bail!("interactive viewing requires terminal output; use --export for PNG output");
         }
+        // Crossterm reads /dev/tty when stdin contains a piped document.
         terminal::enable_raw_mode().context("enabling terminal raw mode")?;
         // Construct before any fallible output so partial initialization is cleaned up.
         let guard = Self;

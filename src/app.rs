@@ -24,7 +24,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     graphics::{self, TerminalGuard, Viewport},
-    render::{self, Document, RenderOptions},
+    render::{self, Document, RenderOptions, Source},
 };
 
 #[path = "raster_cache.rs"]
@@ -229,11 +229,11 @@ struct Tab {
 }
 
 impl Tab {
-    fn open(path: &Path, options: RenderOptions) -> Result<Self> {
+    fn open(source: Arc<Source>, options: RenderOptions) -> Result<Self> {
         // Associate the rendering with the version Pandoc is about to read.
-        let stamp = stamp(path);
+        let stamp = stamp(&source);
         let document = render::render(
-            path,
+            source,
             RenderOptions {
                 dark: options.dark,
                 ppi: options.ppi,
@@ -321,9 +321,9 @@ impl Tab {
     }
 
     fn rebuild(&mut self, dark: bool) -> Result<()> {
-        let source_stamp = stamp(&self.document.path);
+        let source_stamp = stamp(&self.document.source);
         let document = render::render(
-            &self.document.path,
+            Arc::clone(&self.document.source),
             RenderOptions {
                 dark,
                 ppi: self.options.ppi,
@@ -404,7 +404,10 @@ impl Tab {
     }
 }
 
-fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
+fn stamp(source: &Source) -> Option<(SystemTime, u64)> {
+    let Source::File(path) = source else {
+        return None;
+    };
     let metadata = fs::metadata(path).ok()?;
     Some((metadata.modified().ok()?, metadata.len()))
 }
@@ -520,7 +523,7 @@ impl App {
                 ppi: tab.options.ppi,
             },
         );
-        let tab = Tab::open(path, options)?;
+        let tab = Tab::open(Arc::new(Source::file(path)?), options)?;
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.message.clear();
@@ -623,12 +626,7 @@ impl App {
         if file.contains(':') || file.starts_with("//") {
             bail!("unsupported link scheme: {target}");
         }
-        let path = tab
-            .document
-            .path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(decode(file)?);
+        let path = tab.document.source.directory().join(decode(file)?);
         if !markdown(&path) {
             bail!("only Markdown files and http(s)/mailto links can be opened");
         }
@@ -901,7 +899,7 @@ impl App {
                 let path = self
                     .tabs
                     .get(self.active)
-                    .and_then(|tab| tab.document.path.parent())
+                    .map(|tab| tab.document.source.directory())
                     .unwrap_or(Path::new("."))
                     .to_owned();
                 self.browse(&path)?;
@@ -1123,12 +1121,7 @@ impl App {
         let mut remaining = view.columns.saturating_sub(1);
         for (index, tab) in self.tabs.iter().enumerate() {
             let active = index == self.active;
-            let name = tab
-                .document
-                .path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy();
+            let name = tab.document.source.name().to_string_lossy();
             queue!(
                 out,
                 SetBackgroundColor(if active { theme::BLUE } else { theme::BG }),
@@ -1675,7 +1668,7 @@ fn decode(text: &str) -> Result<String> {
     String::from_utf8(bytes).context("link is not valid UTF-8")
 }
 
-pub fn run(paths: Vec<PathBuf>, options: RenderOptions) -> Result<()> {
+pub fn run(sources: Vec<Arc<Source>>, options: RenderOptions) -> Result<()> {
     let (sender, events) = mpsc::channel();
     let raster_sender = sender.clone();
     let mut app = App {
@@ -1692,9 +1685,9 @@ pub fn run(paths: Vec<PathBuf>, options: RenderOptions) -> Result<()> {
             let _ = raster_sender.send(Wake::Raster);
         })?,
     };
-    for path in paths {
+    for source in sources {
         app.tabs.push(Tab::open(
-            &path,
+            source,
             RenderOptions {
                 dark: app.defaults.dark,
                 ppi: app.defaults.ppi,
@@ -1761,7 +1754,7 @@ pub fn run(paths: Vec<PathBuf>, options: RenderOptions) -> Result<()> {
         if last_check.elapsed() >= Duration::from_millis(750) {
             last_check = Instant::now();
             if let Some(tab) = app.tabs.get_mut(app.active) {
-                let current = stamp(&tab.document.path);
+                let current = stamp(&tab.document.source);
                 if current != tab.stamp {
                     app.scroll.cancel();
                     // A failed edit leaves the old document usable; retry on the next edit or r.

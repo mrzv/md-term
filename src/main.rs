@@ -2,7 +2,11 @@ mod app;
 mod graphics;
 mod render;
 
-use std::{io::IsTerminal, path::PathBuf};
+use std::{
+    io::{self, IsTerminal},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -11,7 +15,8 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
-    /// Markdown documents to open in tabs; omit to browse the current directory.
+    /// Markdown documents to open in tabs; use - for stdin.
+    /// With no files, read piped stdin or browse the current directory.
     files: Vec<PathBuf>,
     /// Use light document colors instead of dark colors.
     #[arg(long)]
@@ -25,23 +30,47 @@ struct Args {
 }
 
 fn run() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    if args.files.is_empty() && !io::stdin().is_terminal() {
+        args.files.push(PathBuf::from("-"));
+    }
+    if args.export.is_some() && args.files.len() != 1 {
+        bail!("--export requires exactly one Markdown document");
+    }
+    if args
+        .files
+        .iter()
+        .filter(|path| path.as_os_str() == "-")
+        .count()
+        > 1
+    {
+        bail!("stdin may only be specified once");
+    }
+    if args.export.is_none() && !io::stdout().is_terminal() {
+        bail!(
+            "interactive viewing requires terminal output; use --export PNG for noninteractive rendering"
+        );
+    }
+    let mut sources = args
+        .files
+        .into_iter()
+        .map(|path| {
+            let source = if path == Path::new("-") {
+                render::Source::stdin(&mut io::stdin().lock())
+            } else {
+                render::Source::file(&path)
+            }?;
+            Ok(Arc::new(source))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let options = render::RenderOptions {
         dark: !args.light,
         ppi: args.ppi,
     };
     if let Some(output) = args.export {
-        if args.files.len() != 1 {
-            bail!("--export requires exactly one Markdown document");
-        }
-        return render::export(&args.files[0], &output, options);
+        return render::export(sources.pop().unwrap(), &output, options);
     }
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        bail!(
-            "interactive viewing requires a terminal; use --export PNG for noninteractive rendering"
-        );
-    }
-    app::run(args.files, options).context("viewer failed")
+    app::run(sources, options).context("viewer failed")
 }
 
 fn main() {

@@ -3,10 +3,12 @@ use resvg::{tiny_skia, usvg};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub struct RenderOptions {
@@ -23,8 +25,61 @@ pub struct Entry {
     pub id: Option<String>,
 }
 
+pub enum Source {
+    File(PathBuf),
+    Stdin {
+        snapshot: tempfile::NamedTempFile,
+        directory: PathBuf,
+    },
+}
+
+impl Source {
+    pub fn file(path: &Path) -> Result<Self> {
+        let path = fs::canonicalize(path)
+            .with_context(|| format!("cannot open Markdown document {}", path.display()))?;
+        ensure!(path.is_file(), "not a Markdown file: {}", path.display());
+        Ok(Self::File(path))
+    }
+
+    pub fn stdin(input: &mut impl io::Read) -> Result<Self> {
+        let directory =
+            std::env::current_dir().context("cannot determine stdin resource directory")?;
+        let mut snapshot = tempfile::Builder::new()
+            .prefix("md-term-stdin-")
+            .suffix(".md")
+            .tempfile()
+            .context("cannot create private stdin snapshot")?;
+        io::copy(input, snapshot.as_file_mut()).context("cannot read Markdown from stdin")?;
+        Ok(Self::Stdin {
+            snapshot,
+            directory,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::File(path) => path,
+            Self::Stdin { snapshot, .. } => snapshot.path(),
+        }
+    }
+
+    pub fn directory(&self) -> &Path {
+        match self {
+            Self::File(path) => path.parent().unwrap_or(Path::new(".")),
+            Self::Stdin { directory, .. } => directory,
+        }
+    }
+
+    pub fn name(&self) -> &OsStr {
+        match self {
+            Self::File(path) => path.file_name().unwrap_or_default(),
+            Self::Stdin { .. } => OsStr::new("stdin"),
+        }
+    }
+}
+
 pub struct Document {
-    pub path: PathBuf,
+    pub source: Arc<Source>,
     pub entries: Vec<Entry>,
     tree: usvg::Tree,
 }
@@ -122,14 +177,11 @@ const PREAMBLE: &str = r##"
 }
 "##;
 
-pub fn render(path: &Path, options: RenderOptions) -> Result<Document> {
+pub fn render(source: Arc<Source>, options: RenderOptions) -> Result<Document> {
     ensure!(
         options.ppi > 0,
         "render resolution must be greater than zero"
     );
-    let path = fs::canonicalize(path)
-        .with_context(|| format!("cannot open Markdown document {}", path.display()))?;
-    ensure!(path.is_file(), "not a Markdown file: {}", path.display());
     let work = tempfile::Builder::new()
         .prefix("md-term-")
         .tempdir()
@@ -141,7 +193,7 @@ pub fn render(path: &Path, options: RenderOptions) -> Result<Document> {
             .arg(READER)
             .arg("--to=json")
             .arg("--")
-            .arg(&path),
+            .arg(source.path()),
         "reading Markdown with Pandoc",
     )?;
     let mut document: Value =
@@ -151,7 +203,7 @@ pub fn render(path: &Path, options: RenderOptions) -> Result<Document> {
         .get_mut("blocks")
         .context("Pandoc document has no blocks")?;
     let mut sanitizer = Sanitizer {
-        base: path.parent().context("document has no parent directory")?,
+        base: source.directory(),
         work: work.path(),
         images: HashMap::new(),
     };
@@ -178,7 +230,7 @@ pub fn render(path: &Path, options: RenderOptions) -> Result<Document> {
     } else {
         ["#ffffff", "#24292f", "#f3f4f6", "#9ca3af", "#0969da"]
     };
-    let mut source = String::new();
+    let mut typst_source = String::new();
     for (name, color) in [
         "background",
         "foreground",
@@ -189,12 +241,12 @@ pub fn render(path: &Path, options: RenderOptions) -> Result<Document> {
     .into_iter()
     .zip(palette)
     {
-        source.push_str(&format!("#let md-{name} = rgb(\"{color}\")\n"));
+        typst_source.push_str(&format!("#let md-{name} = rgb(\"{color}\")\n"));
     }
-    source.push_str(PREAMBLE);
-    source.push_str(&body);
+    typst_source.push_str(PREAMBLE);
+    typst_source.push_str(&body);
     let source_path = work.path().join("document.typ");
-    fs::write(&source_path, source).context("cannot write generated Typst document")?;
+    fs::write(&source_path, typst_source).context("cannot write generated Typst document")?;
     let svg_path = work.path().join("document.svg");
     run(
         Command::new("typst")
@@ -228,14 +280,14 @@ pub fn render(path: &Path, options: RenderOptions) -> Result<Document> {
     )?;
     let entries = parse_entries(&query)?;
     Ok(Document {
-        path,
+        source,
         entries,
         tree,
     })
 }
 
 /// Export never truncates an existing file, including a dangling symlink.
-pub fn export(path: &Path, output: &Path, options: RenderOptions) -> Result<()> {
+pub fn export(source: Arc<Source>, output: &Path, options: RenderOptions) -> Result<()> {
     // Fail cheaply before rendering, while create_new below closes the race.
     match fs::symlink_metadata(output) {
         Ok(_) => bail!("output already exists: {}", output.display()),
@@ -243,7 +295,7 @@ pub fn export(path: &Path, output: &Path, options: RenderOptions) -> Result<()> 
         Err(error) => return Err(error).context("cannot inspect export destination"),
     }
     let ppi = options.ppi;
-    let document = render(path, options)?;
+    let document = render(source, options)?;
     let (width, height) = document.dimensions(ppi);
     let raster = document.rasterize(ppi, 0, 0, width, height)?;
     let png = raster
@@ -634,7 +686,7 @@ mod tests {
         )
         .unwrap();
         let document = Document {
-            path: PathBuf::new(),
+            source: Arc::new(Source::File(PathBuf::new())),
             entries: Vec::new(),
             tree,
         };
@@ -674,7 +726,7 @@ mod tests {
         )
         .unwrap();
         let document = Document {
-            path: PathBuf::new(),
+            source: Arc::new(Source::File(PathBuf::new())),
             entries: Vec::new(),
             tree,
         };
