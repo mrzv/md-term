@@ -14,9 +14,12 @@ use crossterm::terminal::{
 };
 
 const PAYLOAD_CHUNK_SIZE: usize = 4096;
-const IMAGE_ID: u32 = 1;
-static NEXT_FRAME: AtomicU64 = AtomicU64::new(1);
-// Only this generation owns IMAGE_ID. Switching frames replaces its pixel data.
+// Kitty and Ghostty reject larger PNG dimensions, regardless of placement crop.
+pub const MAX_IMAGE_DIMENSION: u32 = 10_000;
+// The low bit selects one of two terminal image slots; the remaining bits
+// identify the raster generation. Keep the old placement until its replacement
+// has finished uploading, then release its pixels.
+static NEXT_FRAME: AtomicU64 = AtomicU64::new(2);
 static UPLOADED_FRAME: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,12 +49,16 @@ pub fn viewport(top: u16) -> Result<Viewport> {
     let cell_height = (u32::from(pixel_height) / u32::from(rows)).max(1);
     let cell_width = if pixel_width < columns { 8 } else { cell_width };
     let cell_height = if pixel_height < rows { 16 } else { cell_height };
+    let height = u32::from(rows - top - 1) * cell_height;
+    if height > MAX_IMAGE_DIMENSION {
+        bail!("terminal drawable height exceeds the {MAX_IMAGE_DIMENSION}-pixel graphics limit");
+    }
     Ok(Viewport {
         columns,
         rows,
         top,
         width: u32::from(columns) * cell_width,
-        height: u32::from(rows - top - 1) * cell_height,
+        height,
     })
 }
 
@@ -91,7 +98,9 @@ impl Drop for TerminalGuard {
         // Restore input first, even if writing to a disconnected terminal fails.
         let _ = terminal::disable_raw_mode();
         let mut out = io::stdout();
-        let _ = write!(out, "\x1b_Ga=d,d=I,i={IMAGE_ID},q=2\x1b\\");
+        for image_id in 1..=2 {
+            let _ = write!(out, "\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\");
+        }
         let _ = execute!(
             out,
             DisableMouseCapture,
@@ -121,11 +130,14 @@ impl Frame {
         if width == 0 || height == 0 {
             bail!("viewport image has zero dimensions");
         }
+        if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
+            bail!("viewport image exceeds the {MAX_IMAGE_DIMENSION}-pixel graphics limit");
+        }
         Ok(Self {
             width,
             height,
             encoded_png: STANDARD.encode(png),
-            generation: NEXT_FRAME.fetch_add(1, Ordering::Relaxed),
+            generation: NEXT_FRAME.fetch_add(2, Ordering::Relaxed),
         })
     }
 
@@ -142,26 +154,14 @@ impl Frame {
         let crop = crop(self.width, self.height, view, x, y);
         let cell_width = (view.width / u32::from(view.columns)).max(1);
         let cell_height = (view.height / u32::from(view.rows - view.top - 1)).max(1);
-        placements_clear(out)?;
-        if UPLOADED_FRAME.load(Ordering::Relaxed) != self.generation {
-            // Replace the previous raster: terminal storage stays at one viewport.
-            UPLOADED_FRAME.store(0, Ordering::Relaxed);
-            write!(out, "\x1b_Ga=d,d=I,i={IMAGE_ID},q=2\x1b\\")?;
-            let chunks = self.encoded_png.as_bytes().chunks(PAYLOAD_CHUNK_SIZE);
-            let count = chunks.len();
-            for (index, chunk) in chunks.enumerate() {
-                let more = u8::from(index + 1 < count);
-                if index == 0 {
-                    write!(out, "\x1b_Ga=t,t=d,f=100,i={IMAGE_ID},q=2,m={more};")?;
-                } else {
-                    write!(out, "\x1b_Gq=2,m={more};")?;
-                }
-                out.write_all(chunk)?;
-                out.write_all(b"\x1b\\")?;
-            }
-            out.flush()?;
-            UPLOADED_FRAME.store(self.generation, Ordering::Relaxed);
-        }
+        let previous = UPLOADED_FRAME.load(Ordering::Relaxed);
+        let cached = previous & !1 == self.generation;
+        let slot = if cached {
+            previous & 1
+        } else {
+            (previous & 1) ^ 1
+        };
+        let image_id = slot + 1;
         execute!(
             out,
             MoveTo(
@@ -169,17 +169,49 @@ impl Frame {
                 view.top + (crop.top / cell_height) as u16
             )
         )?;
-        write!(
-            out,
-            "\x1b_Ga=p,i={IMAGE_ID},p=1,x={},y={},w={},h={},X={},Y={},C=1,q=2\x1b\\",
-            crop.x,
-            crop.y,
-            crop.width,
-            crop.height,
-            crop.left % cell_width,
-            crop.top % cell_height,
-        )?;
+        if cached {
+            write!(
+                out,
+                "\x1b_Ga=p,i={image_id},p=1,x={},y={},w={},h={},X={},Y={},C=1,q=2\x1b\\",
+                crop.x,
+                crop.y,
+                crop.width,
+                crop.height,
+                crop.left % cell_width,
+                crop.top % cell_height,
+            )?;
+        } else {
+            // A combined upload/placement is displayed only once all chunks
+            // arrive. Never remove the visible raster before that point.
+            UPLOADED_FRAME.store(0, Ordering::Relaxed);
+            let chunks = self.encoded_png.as_bytes().chunks(PAYLOAD_CHUNK_SIZE);
+            let count = chunks.len();
+            for (index, chunk) in chunks.enumerate() {
+                let more = u8::from(index + 1 < count);
+                if index == 0 {
+                    write!(
+                        out,
+                        "\x1b_Ga=T,t=d,f=100,i={image_id},p=1,x={},y={},w={},h={},X={},Y={},C=1,q=2,m={more};",
+                        crop.x,
+                        crop.y,
+                        crop.width,
+                        crop.height,
+                        crop.left % cell_width,
+                        crop.top % cell_height,
+                    )?;
+                } else {
+                    write!(out, "\x1b_Gq=2,m={more};")?;
+                }
+                out.write_all(chunk)?;
+                out.write_all(b"\x1b\\")?;
+            }
+            if previous != 0 {
+                let previous_id = (previous & 1) + 1;
+                write!(out, "\x1b_Ga=d,d=I,i={previous_id},q=2\x1b\\")?;
+            }
+        }
         out.flush()?;
+        UPLOADED_FRAME.store(self.generation | slot, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -190,7 +222,11 @@ pub fn clear(out: &mut impl Write) -> io::Result<()> {
 }
 
 pub fn placements_clear(out: &mut impl Write) -> io::Result<()> {
-    write!(out, "\x1b_Ga=d,d=i,i={IMAGE_ID},q=2\x1b\\")?;
+    let uploaded = UPLOADED_FRAME.load(Ordering::Relaxed);
+    if uploaded != 0 {
+        let image_id = (uploaded & 1) + 1;
+        write!(out, "\x1b_Ga=d,d=i,i={image_id},q=2\x1b\\")?;
+    }
     out.flush()
 }
 
@@ -272,5 +308,139 @@ mod tests {
                 top: 0,
             }
         );
+    }
+
+    #[derive(Default)]
+    struct TerminalImages {
+        images: std::collections::HashMap<u64, image::RgbaImage>,
+        placements: std::collections::HashMap<u64, (u32, u32, u32, u32)>,
+        pending: Option<(u64, (u32, u32, u32, u32), String)>,
+        uploads: usize,
+    }
+
+    impl TerminalImages {
+        fn apply(&mut self, output: &[u8], must_remain_visible: bool) {
+            for command in output.split(|byte| *byte == 0x1b) {
+                let Some(command) = command.strip_prefix(b"_G") else {
+                    continue;
+                };
+                let command = std::str::from_utf8(command).unwrap();
+                let (control, payload) = command.split_once(';').unwrap_or((command, ""));
+                let fields: std::collections::HashMap<_, _> = control
+                    .split(',')
+                    .filter_map(|field| field.split_once('='))
+                    .collect();
+                let number = |key| fields.get(key).unwrap_or(&"0").parse::<u64>().unwrap();
+                let id = number("i");
+                let area = (
+                    number("x") as u32,
+                    number("y") as u32,
+                    number("w") as u32,
+                    number("h") as u32,
+                );
+                match fields.get("a").copied() {
+                    Some("T") | Some("t") => {
+                        self.images.remove(&id);
+                        self.placements.remove(&id);
+                        self.pending = Some((id, area, String::new()));
+                        self.uploads += 1;
+                    }
+                    Some("p") => {
+                        assert!(self.images.contains_key(&id), "placing missing pixels");
+                        self.placements.insert(id, area);
+                    }
+                    Some("d") => {
+                        assert!(self.pending.is_none(), "deletion aborts a chunked upload");
+                        self.placements.remove(&id);
+                        if fields.get("d") == Some(&"I") {
+                            self.images.remove(&id);
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some((_, _, data)) = &mut self.pending {
+                    data.push_str(payload);
+                    if number("m") == 0 {
+                        let (id, area, data) = self.pending.take().unwrap();
+                        let png = STANDARD.decode(data).unwrap();
+                        let pixels = image::load_from_memory(&png).unwrap().to_rgba8();
+                        self.images.insert(id, pixels);
+                        self.placements.insert(id, area);
+                    }
+                }
+                if must_remain_visible {
+                    assert!(!self.placements.is_empty(), "redraw exposed a blank canvas");
+                }
+                assert!(self.images.len() <= 2, "unbounded terminal raster storage");
+            }
+        }
+
+        fn visible_pixel(&self) -> [u8; 4] {
+            let (id, &(x, y, _, _)) = self.placements.iter().next().unwrap();
+            self.images[id].get_pixel(x, y).0
+        }
+    }
+
+    #[test]
+    fn replacements_and_cached_crops_keep_pixels_visible_and_bounded() {
+        let make_frame = |seed: u32| {
+            let mut pixels = resvg::tiny_skia::Pixmap::new(64, 960).unwrap();
+            let mut state = seed;
+            for pixel in pixels.data_mut().chunks_exact_mut(4) {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                pixel.copy_from_slice(&[
+                    (state >> 24) as u8,
+                    (state >> 16) as u8,
+                    (state >> 8) as u8,
+                    255,
+                ]);
+            }
+            let png = pixels.encode_png().unwrap();
+            let first = image::load_from_memory(&png).unwrap().to_rgba8();
+            let frame = Frame::from_png(png).unwrap();
+            assert!(frame.encoded_png.len() > PAYLOAD_CHUNK_SIZE);
+            (frame, first)
+        };
+        let (first, first_pixels) = make_frame(1);
+        let (second, second_pixels) = make_frame(2);
+        let mut terminal = TerminalImages::default();
+        let mut output = Vec::new();
+        UPLOADED_FRAME.store(0, Ordering::Relaxed);
+
+        first.draw(&mut output, view(), 0, 0).unwrap();
+        terminal.apply(&output, false);
+        assert_eq!(terminal.visible_pixel(), first_pixels.get_pixel(0, 0).0);
+        assert_eq!(terminal.uploads, 1);
+
+        output.clear();
+        first.draw(&mut output, view(), 0, 400).unwrap();
+        terminal.apply(&output, true);
+        assert_eq!(terminal.visible_pixel(), first_pixels.get_pixel(0, 400).0);
+        assert_eq!(terminal.uploads, 1);
+
+        output.clear();
+        second.draw(&mut output, view(), 0, 480).unwrap();
+        terminal.apply(&output, true);
+        assert_eq!(terminal.visible_pixel(), second_pixels.get_pixel(0, 480).0);
+        assert_eq!(terminal.images.len(), 1);
+
+        output.clear();
+        clear(&mut output).unwrap();
+        terminal.apply(&output, false);
+        assert!(terminal.placements.is_empty());
+        assert_eq!(terminal.images.len(), 1);
+        output.clear();
+        second.draw(&mut output, view(), 0, 120).unwrap();
+        terminal.apply(&output, true);
+        assert_eq!(terminal.visible_pixel(), second_pixels.get_pixel(0, 120).0);
+        assert_eq!(terminal.uploads, 2);
+
+        output.clear();
+        first.draw(&mut output, view(), 0, 240).unwrap();
+        terminal.apply(&output, true);
+        assert_eq!(terminal.visible_pixel(), first_pixels.get_pixel(0, 240).0);
+        assert_eq!(terminal.images.len(), 1);
+        assert_eq!(terminal.uploads, 3);
+        UPLOADED_FRAME.store(0, Ordering::Relaxed);
     }
 }

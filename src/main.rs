@@ -16,8 +16,8 @@ struct Args {
     /// Use light document colors instead of dark colors.
     #[arg(long)]
     light: bool,
-    /// Raster resolution; zoom changes this without reflowing the document.
-    #[arg(long, default_value_t = 96, value_parser = clap::value_parser!(u32).range(36..=288))]
+    /// Raster resolution (96 PPI = 100%); defaults to 250% zoom.
+    #[arg(long, default_value_t = 240, value_parser = clap::value_parser!(u32).range(36..=288))]
     ppi: u32,
     /// Render the full continuous document to a new PNG without terminal mode.
     #[arg(long, value_name = "PNG")]

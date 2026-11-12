@@ -27,6 +27,93 @@ struct Position {
     y: u32,
 }
 
+const SCROLL_FRAME: Duration = Duration::from_millis(16);
+
+struct SmoothScroll {
+    enabled: bool,
+    target: Option<u32>,
+    tick: Instant,
+}
+
+impl SmoothScroll {
+    fn new(now: Instant) -> Self {
+        Self {
+            enabled: true,
+            target: None,
+            tick: now,
+        }
+    }
+
+    fn cancel(&mut self) {
+        self.target = None;
+    }
+
+    fn scroll(&mut self, position: &mut u32, delta: i64, maximum: u32, now: Instant) -> bool {
+        let before = *position;
+        *position = (*position).min(maximum);
+        let mut target = self.target.unwrap_or(*position).min(maximum);
+        let remaining = i64::from(target) - i64::from(*position);
+        // Reversing starts from the displayed position, not an unfinished animation.
+        if remaining.signum() != delta.signum() {
+            target = *position;
+        }
+        target = i64::from(target)
+            .saturating_add(delta)
+            .clamp(0, i64::from(maximum)) as u32;
+        if self.enabled {
+            if self.target.is_none() {
+                self.tick = now;
+            }
+            self.target = (target != *position).then_some(target);
+        } else {
+            *position = target;
+            self.cancel();
+        }
+        before != *position
+    }
+
+    fn advance(&mut self, position: &mut u32, now: Instant) -> bool {
+        let Some(target) = self.target else {
+            return false;
+        };
+        if now.duration_since(self.tick) < SCROLL_FRAME {
+            return false;
+        }
+        self.tick = now;
+        let remaining = i64::from(target) - i64::from(*position);
+        let step = remaining.unsigned_abs().div_ceil(4) as i64 * remaining.signum();
+        *position = (i64::from(*position) + step) as u32;
+        if *position == target {
+            self.cancel();
+        }
+        step != 0
+    }
+
+    fn wait(&self, now: Instant) -> Duration {
+        let background = Duration::from_millis(100);
+        if self.target.is_some() {
+            SCROLL_FRAME
+                .saturating_sub(now.duration_since(self.tick))
+                .min(background)
+        } else {
+            background
+        }
+    }
+
+    fn toggle(&mut self, position: &mut u32) {
+        self.enabled = !self.enabled;
+        if !self.enabled {
+            if let Some(target) = self.target.take() {
+                *position = target;
+            }
+        }
+    }
+}
+
+fn zoom_percent(ppi: u32) -> u32 {
+    (f64::from(ppi) * 100.0 / 96.0).round() as u32
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FrameKey {
     position: Position,
@@ -35,6 +122,67 @@ struct FrameKey {
     ppi: u32,
     viewport_width: u32,
     viewport_height: u32,
+}
+
+impl FrameKey {
+    fn region(position: Position, width: u32, height: u32, ppi: u32, view: Viewport) -> Self {
+        let region_height = view
+            .height
+            .saturating_mul(3)
+            .min(height)
+            .min(graphics::MAX_IMAGE_DIMENSION);
+        Self {
+            position: Position {
+                x: position.x,
+                y: position
+                    .y
+                    .saturating_sub(region_height.saturating_sub(view.height) / 2)
+                    .min(height.saturating_sub(region_height)),
+            },
+            width: view.width.min(width.saturating_sub(position.x)),
+            height: region_height,
+            ppi,
+            viewport_width: view.width,
+            viewport_height: view.height,
+        }
+    }
+
+    fn contains(self, position: Position, document_height: u32, ppi: u32, view: Viewport) -> bool {
+        self.ppi == ppi
+            && self.viewport_width == view.width
+            && self.viewport_height == view.height
+            && self.position.x == position.x
+            && self.position.y <= position.y
+            && position
+                .y
+                .saturating_add(view.height.min(document_height.saturating_sub(position.y)))
+                <= self.position.y.saturating_add(self.height)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Performance {
+    render: Duration,
+    encode: Duration,
+    output: Duration,
+    cache_hit: bool,
+}
+
+// Keep Frame::draw's flush inside the enclosing synchronized update.
+struct FrameOutput<'a, W>(&'a mut W);
+
+impl<W: Write> Write for FrameOutput<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.write(bytes)
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.0.write_all(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct Tab {
@@ -79,27 +227,30 @@ impl Tab {
         })
     }
 
-    fn frame(&mut self, view: Viewport) -> Result<&Frame> {
+    fn prepare_frame(&mut self, view: Viewport) -> Result<Performance> {
         let (width, height) = self.document.dimensions(self.options.ppi);
-        let key = FrameKey {
-            position: self.position,
-            width: view.width.min(width.saturating_sub(self.position.x)),
-            height: view.height.min(height.saturating_sub(self.position.y)),
-            ppi: self.options.ppi,
-            viewport_width: view.width,
-            viewport_height: view.height,
-        };
-        if self.frame.as_ref().is_none_or(|(cached, _)| *cached != key) {
-            let png = self.document.rasterize(
+        let mut performance = Performance::default();
+        if self.frame.as_ref().is_none_or(|(cached, _)| {
+            !cached.contains(self.position, height, self.options.ppi, view)
+        }) {
+            let key = FrameKey::region(self.position, width, height, self.options.ppi, view);
+            let raster = self.document.rasterize(
                 key.ppi,
                 key.position.x,
                 key.position.y,
                 key.width,
                 key.height,
             )?;
-            self.frame = Some((key, Frame::from_png(png)?));
+            performance.render = raster.render_elapsed;
+            performance.encode = raster.encode_elapsed;
+            let encode_started = Instant::now();
+            let frame = Frame::from_png(raster.png)?;
+            performance.encode += encode_started.elapsed();
+            self.frame = Some((key, frame));
+        } else {
+            performance.cache_hit = true;
         }
-        Ok(&self.frame.as_ref().unwrap().1)
+        Ok(performance)
     }
 
     fn navigate(&mut self, next: Position) {
@@ -308,11 +459,39 @@ struct App {
     message: String,
     defaults: RenderOptions,
     quitting: bool,
+    scroll: SmoothScroll,
+    performance: Option<Performance>,
+    show_performance: bool,
 }
 
 impl App {
     fn tab(&mut self) -> Option<&mut Tab> {
         self.tabs.get_mut(self.active)
+    }
+
+    fn scroll_vertical(&mut self, delta: i64, view: Viewport) -> bool {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return false;
+        };
+        let (_, height) = tab.document.dimensions(tab.options.ppi);
+        self.scroll.scroll(
+            &mut tab.position.y,
+            delta,
+            height.saturating_sub(view.height),
+            Instant::now(),
+        )
+    }
+
+    fn advance_scroll(&mut self, now: Instant) -> bool {
+        if !matches!(self.mode, Mode::Normal) {
+            self.scroll.cancel();
+            return false;
+        }
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            self.scroll.cancel();
+            return false;
+        };
+        self.scroll.advance(&mut tab.position.y, now)
     }
 
     fn open(&mut self, path: &Path) -> Result<()> {
@@ -459,31 +638,116 @@ impl App {
         Ok(())
     }
 
-    fn key(&mut self, key: KeyEvent, view: Viewport) -> Result<()> {
+    fn key(&mut self, key: KeyEvent, view: Viewport) -> Result<bool> {
         if key.kind == KeyEventKind::Release {
-            return Ok(());
+            return Ok(false);
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quitting = true;
-            return Ok(());
+            return Ok(false);
         }
         if key.modifiers == KeyModifiers::ALT {
             if let KeyCode::Char(c @ '1'..='9') = key.code {
                 let index = c as usize - '1' as usize;
                 if index < self.tabs.len() {
+                    self.scroll.cancel();
                     self.active = index;
                     self.mode = Mode::Normal;
+                    return Ok(true);
                 }
             }
-            return Ok(());
+            return Ok(false);
         }
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
         {
-            return Ok(());
+            return Ok(false);
         }
+        let had_message = !self.message.is_empty();
         self.message.clear();
+        if matches!(self.mode, Mode::Normal) && key.code == KeyCode::Char('p') {
+            self.show_performance = !self.show_performance;
+            return Ok(true);
+        }
+        if matches!(self.mode, Mode::Normal) {
+            let small = i64::from((view.height / 20).max(1));
+            let large = (u64::from(view.height) * 85 / 100).max(1) as i64;
+            let delta = match key.code {
+                KeyCode::Char('j') | KeyCode::Down => Some(small),
+                KeyCode::Char('k') | KeyCode::Up => Some(-small),
+                KeyCode::Char(' ') | KeyCode::PageDown => Some(large),
+                KeyCode::Backspace | KeyCode::PageUp => Some(-large),
+                _ => None,
+            };
+            if let Some(delta) = delta {
+                return Ok(self.scroll_vertical(delta, view) || had_message);
+            }
+            if key.code == KeyCode::Char('S') {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    self.scroll.toggle(&mut tab.position.y);
+                } else {
+                    self.scroll.enabled = !self.scroll.enabled;
+                }
+                self.message = if self.scroll.enabled {
+                    "Smooth scrolling on"
+                } else {
+                    "Smooth scrolling off"
+                }
+                .into();
+                return Ok(true);
+            }
+            if matches!(
+                key.code,
+                KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right
+            ) {
+                let Some(tab) = self.tab() else {
+                    return Ok(had_message);
+                };
+                let before = tab.position;
+                let delta = if matches!(key.code, KeyCode::Char('h') | KeyCode::Left) {
+                    -small
+                } else {
+                    small
+                };
+                tab.scroll(delta, 0, view);
+                return Ok(tab.position != before || had_message);
+            }
+            if !matches!(
+                key.code,
+                KeyCode::Char(
+                    'q' | 'f'
+                        | 'o'
+                        | '/'
+                        | ':'
+                        | '?'
+                        | 't'
+                        | 'L'
+                        | 'g'
+                        | 'G'
+                        | 'b'
+                        | 'B'
+                        | 'n'
+                        | 'N'
+                        | 'r'
+                        | 'R'
+                        | 'i'
+                        | '+'
+                        | '='
+                        | '-'
+                        | '0'
+                        | 'm'
+                ) | KeyCode::Esc
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::Enter
+                    | KeyCode::Home
+                    | KeyCode::End
+            ) {
+                return Ok(had_message);
+            }
+        }
+        self.scroll.cancel();
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Prompt(prompt, mut text) => match key.code {
                 KeyCode::Esc => {}
@@ -590,7 +854,7 @@ impl App {
             },
             Mode::Normal => self.normal(key.code, view)?,
         }
-        Ok(())
+        Ok(true)
     }
 
     fn normal(&mut self, code: KeyCode, view: Viewport) -> Result<()> {
@@ -679,20 +943,7 @@ impl App {
                 let Some(tab) = self.tab() else {
                     return Ok(());
                 };
-                let step = (view.height / u32::from(view.rows.saturating_sub(view.top + 1).max(1)))
-                    .max(1) as i64
-                    * 3;
                 match code {
-                    KeyCode::Char('j') | KeyCode::Down => tab.scroll(0, step, view),
-                    KeyCode::Char('k') | KeyCode::Up => tab.scroll(0, -step, view),
-                    KeyCode::Char('h') | KeyCode::Left => tab.scroll(-step, 0, view),
-                    KeyCode::Char('l') | KeyCode::Right => tab.scroll(step, 0, view),
-                    KeyCode::Char(' ') | KeyCode::PageDown => {
-                        tab.scroll(0, view.height as i64, view)
-                    }
-                    KeyCode::Backspace | KeyCode::PageUp => {
-                        tab.scroll(0, -(view.height as i64), view)
-                    }
                     KeyCode::Char('g') | KeyCode::Home => tab.jump_percent(0, view),
                     KeyCode::Char('G') | KeyCode::End => tab.jump_percent(100, view),
                     KeyCode::Char('b') => tab.history(false),
@@ -733,26 +984,46 @@ impl App {
     }
 
     fn draw(&mut self, out: &mut impl Write, view: Viewport) -> Result<()> {
-        // Synchronized output avoids exposing half-cleared frames in supporting terminals.
+        let popup = matches!(self.mode, Mode::List(_) | Mode::Help(_));
+        // Rasterization/encoding can exceed the terminal's synchronized-update timeout.
+        // Finish them before starting output, leaving the previous image visible.
+        self.performance = if let Some(tab) = self.tab() {
+            tab.fit(view);
+            if !popup && view.width > 0 && view.height > 0 && view.rows > view.top + 1 {
+                Some(tab.prepare_frame(view)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         out.write_all(b"\x1b[?2026h")?;
-        let result = self.draw_inner(out, view);
+        let started = Instant::now();
+        let result = self.draw_inner(&mut FrameOutput(out), view);
         let end = out.write_all(b"\x1b[?2026l").and_then(|()| out.flush());
-        result.and(end.map_err(Into::into))
+        if let Some(performance) = &mut self.performance {
+            performance.output = started.elapsed();
+        }
+        result.and(end.map_err(Into::into))?;
+        // Report the completed image output, including its actual flush, not terminal latency.
+        out.write_all(b"\x1b[?2026h")?;
+        let result = self.draw_status(out, view);
+        let end = out.write_all(b"\x1b[?2026l").and_then(|()| out.flush());
+        result.and(end).map_err(Into::into)
     }
 
     fn draw_inner(&mut self, out: &mut impl Write, view: Viewport) -> Result<()> {
-        if let Some(tab) = self.tab() {
-            tab.fit(view);
-        }
         let popup = matches!(self.mode, Mode::List(_) | Mode::Help(_));
         queue!(
             out,
             SetAttribute(Attribute::Reset),
             SetBackgroundColor(if popup { theme::BG_DARK1 } else { theme::BG }),
-            SetForegroundColor(theme::FG),
-            Clear(ClearType::All)
+            SetForegroundColor(theme::FG)
         )?;
         if popup {
+            for row in 0..view.rows {
+                queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+            }
             graphics::clear(out)?;
             match &self.mode {
                 Mode::List(list) => draw_list(out, view, list)?,
@@ -760,9 +1031,19 @@ impl App {
                 _ => {}
             }
         } else {
-            if let Some(tab) = self.tab() {
+            if let Some(tab) = self.tabs.get(self.active) {
                 if view.width > 0 && view.height > 0 && view.rows > view.top + 1 {
-                    tab.frame(view)?.draw(out, view, 0, 0)?;
+                    // ED2 also deletes Kitty graphics. Only text rows may be erased here.
+                    for row in view.top..view.rows.saturating_sub(1) {
+                        queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+                    }
+                    let (key, frame) = tab.frame.as_ref().unwrap();
+                    frame.draw(
+                        out,
+                        view,
+                        tab.position.x - key.position.x,
+                        tab.position.y - key.position.y,
+                    )?;
                 } else {
                     graphics::clear(out)?;
                 }
@@ -771,7 +1052,6 @@ impl App {
             }
             self.draw_tabs(out, view)?;
         }
-        self.draw_status(out, view)?;
         queue!(
             out,
             SetBackgroundColor(theme::BG),
@@ -856,8 +1136,7 @@ impl App {
                         out,
                         &format!(
                             "  {}% {}",
-                            (f64::from(tab.options.ppi) * 100.0 / f64::from(tab.base_ppi)).round()
-                                as u32,
+                            zoom_percent(tab.options.ppi),
                             if tab.fit_width { "fit width" } else { "actual" },
                         ),
                         &mut remaining,
@@ -873,6 +1152,33 @@ impl App {
                 } else {
                     queue!(out, SetForegroundColor(theme::COMMENT))?;
                     segment(out, "f: browse  o: open  q: quit", &mut remaining)?;
+                }
+                if let Some(performance) = self.performance {
+                    queue!(out, SetForegroundColor(theme::COMMENT))?;
+                    let cache = if performance.cache_hit { " cache" } else { "" };
+                    if self.show_performance {
+                        segment(
+                            out,
+                            &format!(
+                                "  render {:.1}ms  encode {:.1}ms  output {:.1}ms{cache}",
+                                performance.render.as_secs_f64() * 1000.0,
+                                performance.encode.as_secs_f64() * 1000.0,
+                                performance.output.as_secs_f64() * 1000.0,
+                            ),
+                            &mut remaining,
+                        )?;
+                    } else {
+                        segment(
+                            out,
+                            &format!(
+                                "  frame {:.1}ms{cache}",
+                                (performance.render + performance.encode + performance.output)
+                                    .as_secs_f64()
+                                    * 1000.0,
+                            ),
+                            &mut remaining,
+                        )?;
+                    }
                 }
                 if !self.message.is_empty() {
                     queue!(out, SetForegroundColor(theme::GREEN))?;
@@ -967,10 +1273,10 @@ mod theme {
 }
 
 const HELP_NAVIGATION: &[(&str, &str)] = &[
-    ("j/k · ↑/↓ · wheel", "Scroll vertically"),
+    ("j/k · ↑/↓ · wheel", "Smooth vertical scroll (S toggles)"),
     ("h/l · ←/→", "Pan horizontally"),
-    ("Space · PgDn", "Viewport forward"),
-    ("Backspace · PgUp", "Viewport backward"),
+    ("Space · PgDn", "Scroll forward 85% viewport"),
+    ("Backspace · PgUp", "Scroll backward 85% viewport"),
     ("g/G · Home/End", "Document top / bottom"),
     (":", "Jump to percentage"),
     ("/", "Search text blocks"),
@@ -984,6 +1290,8 @@ const HELP_NAVIGATION: &[(&str, &str)] = &[
 const HELP_VIEWER: &[(&str, &str)] = &[
     ("m", "Fit width / actual"),
     ("+ / - / 0", "Zoom in / out / reset"),
+    ("S", "Toggle smooth scrolling (on by default)"),
+    ("p", "Toggle detailed render / encode / output timings"),
     ("i", "Toggle light / dark"),
     ("r / R", "Reload document"),
     ("f", "Browse files in a new tab"),
@@ -1327,6 +1635,9 @@ pub fn run(paths: Vec<PathBuf>, options: RenderOptions) -> Result<()> {
         message: String::new(),
         defaults: options,
         quitting: false,
+        scroll: SmoothScroll::new(Instant::now()),
+        performance: None,
+        show_performance: false,
     };
     for path in paths {
         app.tabs.push(Tab::open(
@@ -1354,16 +1665,13 @@ pub fn run(paths: Vec<PathBuf>, options: RenderOptions) -> Result<()> {
             app.draw(&mut out, view)?;
             dirty = false;
         }
-        if event::poll(Duration::from_millis(100))? {
+        if event::poll(app.scroll.wait(Instant::now()))? {
             let result = match event::read()? {
-                Event::Key(key) => {
-                    dirty = true;
-                    app.key(key, view)
-                }
+                Event::Key(key) => app.key(key, view),
                 Event::Resize(_, _) => {
+                    app.scroll.cancel();
                     view = graphics::viewport(u16::from(app.tabs.len() > 1))?;
-                    dirty = true;
-                    Ok(())
+                    Ok(true)
                 }
                 Event::Mouse(mouse) if matches!(app.mode, Mode::Normal) => {
                     let delta = match mouse.kind {
@@ -1371,28 +1679,25 @@ pub fn run(paths: Vec<PathBuf>, options: RenderOptions) -> Result<()> {
                         MouseEventKind::ScrollUp => -48,
                         _ => 0,
                     };
-                    if delta != 0 {
-                        dirty = true;
-                        if let Some(tab) = app.tab() {
-                            tab.scroll(0, delta, view);
-                        }
-                        Ok(())
-                    } else {
-                        Ok(())
-                    }
+                    Ok(delta != 0 && app.scroll_vertical(delta, view))
                 }
-                _ => Ok(()),
+                _ => Ok(false),
             };
-            if let Err(error) = result {
-                app.message = format!("Error: {error:#}");
-                dirty = true;
+            match result {
+                Ok(changed) => dirty |= changed,
+                Err(error) => {
+                    app.message = format!("Error: {error:#}");
+                    dirty = true;
+                }
             }
         }
+        dirty |= app.advance_scroll(Instant::now());
         if last_check.elapsed() >= Duration::from_millis(750) {
             last_check = Instant::now();
-            if let Some(tab) = app.tab() {
+            if let Some(tab) = app.tabs.get_mut(app.active) {
                 let current = stamp(&tab.document.path);
                 if current != tab.stamp {
+                    app.scroll.cancel();
                     // A failed edit leaves the old document usable; retry on the next edit or r.
                     tab.stamp = current;
                     if let Err(error) = tab.rebuild(tab.options.dark) {
@@ -1417,6 +1722,185 @@ pub fn run(paths: Vec<PathBuf>, options: RenderOptions) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scroll_view() -> Viewport {
+        Viewport {
+            columns: 80,
+            rows: 26,
+            top: 0,
+            width: 800,
+            height: 500,
+        }
+    }
+
+    #[test]
+    fn smooth_scroll_accumulates_and_advances_only_when_due() {
+        let now = Instant::now();
+        let mut scroll = SmoothScroll::new(now);
+        let mut position = 100;
+        assert!(!scroll.scroll(&mut position, 100, 1000, now));
+        assert!(!scroll.scroll(&mut position, 100, 1000, now + Duration::from_millis(8)));
+        assert_eq!(scroll.target, Some(300));
+        assert_eq!(
+            scroll.wait(now + Duration::from_millis(8)),
+            Duration::from_millis(8)
+        );
+        assert!(!scroll.advance(&mut position, now + Duration::from_millis(15)));
+        assert_eq!(position, 100);
+        assert!(scroll.advance(&mut position, now + SCROLL_FRAME));
+        assert_eq!(position, 150);
+        assert!(!scroll.advance(&mut position, now + SCROLL_FRAME));
+        assert!(scroll.advance(&mut position, now + SCROLL_FRAME * 2));
+        assert_eq!(position, 188);
+        // A delayed frame performs one proportional step rather than a burst of catch-up ticks.
+        assert!(scroll.advance(&mut position, now + Duration::from_secs(1)));
+        assert_eq!(position, 216);
+    }
+
+    #[test]
+    fn smooth_scroll_finishes_exactly_and_reverses_from_displayed_position() {
+        let now = Instant::now();
+        let mut scroll = SmoothScroll::new(now);
+        let mut position = 100;
+        scroll.scroll(&mut position, 100, 1000, now);
+        scroll.advance(&mut position, now + SCROLL_FRAME);
+        assert_eq!(position, 125);
+        scroll.scroll(&mut position, -10, 1000, now + SCROLL_FRAME);
+        assert_eq!(scroll.target, Some(115));
+        let mut tick = now + SCROLL_FRAME;
+        for _ in 0..20 {
+            tick += SCROLL_FRAME;
+            scroll.advance(&mut position, tick);
+        }
+        assert_eq!(position, 115);
+        assert_eq!(scroll.target, None);
+    }
+
+    #[test]
+    fn smooth_scroll_clamps_targets_without_invisible_backlog() {
+        let now = Instant::now();
+        let mut scroll = SmoothScroll::new(now);
+        let mut position = 95;
+        scroll.scroll(&mut position, i64::MAX, 100, now);
+        scroll.scroll(&mut position, i64::MAX, 100, now);
+        assert_eq!(scroll.target, Some(100));
+        scroll.scroll(&mut position, -10, 100, now);
+        assert_eq!(scroll.target, Some(85));
+        scroll.scroll(&mut position, i64::MIN, 100, now);
+        assert_eq!(scroll.target, Some(0));
+        scroll.cancel();
+        position = 0;
+        scroll.scroll(&mut position, -100, 0, now);
+        assert_eq!(scroll.target, None);
+        assert!(!scroll.advance(&mut position, now + SCROLL_FRAME));
+    }
+
+    #[test]
+    fn smooth_scroll_toggle_flushes_and_disabled_scroll_is_immediate() {
+        let now = Instant::now();
+        let mut scroll = SmoothScroll::new(now);
+        let mut position = 50;
+        assert!(scroll.enabled);
+        scroll.scroll(&mut position, 100, 1000, now);
+        scroll.toggle(&mut position);
+        assert_eq!(position, 150);
+        assert_eq!(scroll.target, None);
+        assert!(!scroll.enabled);
+        assert!(scroll.scroll(&mut position, 25, 1000, now));
+        assert_eq!(position, 175);
+        scroll.toggle(&mut position);
+        scroll.scroll(&mut position, 100, 1000, now);
+        assert_eq!(position, 175);
+        assert_eq!(scroll.target, Some(275));
+    }
+
+    #[test]
+    fn canceled_scroll_cannot_move_a_jump_or_next_document() {
+        let now = Instant::now();
+        let mut scroll = SmoothScroll::new(now);
+        let mut position = 100;
+        scroll.scroll(&mut position, 500, 1000, now);
+        scroll.cancel();
+        position = 900;
+        assert!(!scroll.advance(&mut position, now + SCROLL_FRAME));
+        assert_eq!(position, 900);
+        // A newly scheduled animation has a fresh deadline, not the canceled one's tick.
+        scroll.scroll(&mut position, -100, 1000, now + SCROLL_FRAME * 10);
+        assert!(!scroll.advance(&mut position, now + SCROLL_FRAME * 10));
+        assert!(scroll.advance(&mut position, now + SCROLL_FRAME * 11));
+        assert_eq!(position, 875);
+    }
+
+    #[test]
+    fn overscan_cache_is_bounded_and_contains_visible_scroll_positions() {
+        let view = scroll_view();
+        let origin = Position { x: 50, y: 2000 };
+        let key = FrameKey::region(origin, 2000, 10000, 240, view);
+        assert_eq!(key.position, Position { x: 50, y: 1500 });
+        assert_eq!((key.width, key.height), (800, 1500));
+        assert!(key.contains(origin, 10000, 240, view));
+        assert!(key.contains(Position { x: 50, y: 2500 }, 10000, 240, view));
+        assert!(!key.contains(Position { x: 50, y: 2501 }, 10000, 240, view));
+        assert!(!key.contains(Position { x: 50, y: 1499 }, 10000, 240, view));
+        assert!(!key.contains(Position { x: 51, y: 2000 }, 10000, 240, view));
+        assert!(!key.contains(origin, 10000, 192, view));
+        assert!(!key.contains(origin, 10000, 240, Viewport { width: 801, ..view }));
+        assert!(!key.contains(
+            origin,
+            10000,
+            240,
+            Viewport {
+                height: 501,
+                ..view
+            }
+        ));
+    }
+
+    #[test]
+    fn overscan_cache_handles_document_edges_and_short_documents() {
+        let view = scroll_view();
+        for (height, y, expected_y, expected_height) in [
+            (10000, 0, 0, 1500),
+            (10000, 9500, 8500, 1500),
+            (200, 0, 0, 200),
+        ] {
+            let position = Position { x: 0, y };
+            let key = FrameKey::region(position, 300, height, 240, view);
+            assert_eq!(key.position.y, expected_y);
+            assert_eq!(key.height, expected_height);
+            assert_eq!(key.width, 300);
+            assert!(key.height <= view.height * 3);
+            assert!(key.position.y + key.height <= height);
+            assert!(key.contains(position, height, 240, view));
+        }
+    }
+
+    #[test]
+    fn high_zoom_overscan_respects_terminal_limit_without_losing_visible_region() {
+        for viewport_height in [4000, 6000, 10000] {
+            let view = Viewport {
+                height: viewport_height,
+                ..scroll_view()
+            };
+            for height in [9999u32, 10000, 10001, 20000, 30000] {
+                let maximum = height.saturating_sub(view.height);
+                for y in [0, maximum / 2, maximum] {
+                    let position = Position { x: 0, y };
+                    let key = FrameKey::region(position, 2000, height, 240, view);
+                    assert_eq!(key.height, height.min(graphics::MAX_IMAGE_DIMENSION));
+                    assert!(key.position.y + key.height <= height);
+                    assert!(key.contains(position, height, 240, view));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn displayed_zoom_uses_fixed_96_ppi_reference() {
+        assert_eq!(zoom_percent(96), 100);
+        assert_eq!(zoom_percent(240), 250);
+        assert_eq!(zoom_percent(288), 300);
+    }
 
     #[test]
     fn terminal_strings_cannot_inject_controls_or_overflow_wide_cells() {

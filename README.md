@@ -2,7 +2,7 @@
 
 Graphical Markdown viewer for Kitty, Ghostty, and WezTerm. Its Tokyo Night Moon chrome, conditional tab bar, status line, and centered pickers follow `pdfterm` and `office-term`. The executable is `mdterm`.
 
-Pandoc parses Markdown; Typst lays out one continuous, auto-height vector canvas. Only the visible region is rasterized for the Kitty graphics protocol—there are no page breaks or page navigation. Headings, tables, lists, code, local images, and inline/display TeX math render as a document rather than terminal text.
+Pandoc parses Markdown; Typst lays out one continuous, auto-height vector canvas. A bounded region around the viewport is rasterized for the Kitty graphics protocol—there are no page breaks or page navigation. Headings, tables, lists, code, local images, and inline/display TeX math render as a document rather than terminal text.
 
 ## Install
 
@@ -29,15 +29,17 @@ mdterm --ppi 120 book.md
 mdterm --export document.png README.md
 ```
 
-`--export` renders the entire continuous document without a terminal and refuses to overwrite an existing file. It requires exactly one input and allocates a full-document bitmap, unlike interactive viewing. `--ppi` accepts 36–288 (default 96). Dark rendering is the default.
+`--export` renders the entire continuous document without a terminal and refuses to overwrite an existing file. It requires exactly one input and allocates a full-document bitmap, unlike interactive viewing. `--ppi` accepts 36–288 (default 240, or 250% zoom; 96 PPI is 100%). Dark rendering is the default.
 
 ## Controls
 
 | Key | Action |
 | --- | --- |
-| `j` / `k`, arrows, mouse wheel | Scroll continuously |
+| `j` / `k`, arrows, mouse wheel | Smooth vertical scrolling |
 | `h` / `l`, left/right | Pan horizontally |
-| Space / PageDown; Backspace / PageUp | Scroll one viewport forward/backward |
+| Space / PageDown; Backspace / PageUp | Scroll 85% of the viewport forward/backward |
+| `S` | Toggle smooth scrolling (enabled by default) |
+| `p` | Toggle detailed render / encode / output profiling |
 | `g` / `G`, Home / End | Document top / bottom |
 | `:` | Jump to a percentage (0–100) |
 | `/` | Search rendered text blocks, case-insensitively |
@@ -45,7 +47,7 @@ mdterm --export document.png README.md
 | `t` | Heading outline |
 | Enter / `L` | Browse document links |
 | `b` / `B` | Back / forward navigation history |
-| `+` / `-` / `0` | Zoom in / out / reset |
+| `+` / `-` / `0` | Zoom in / out / reset to startup resolution |
 | `m` | Toggle fit-width / original resolution |
 | `i` | Toggle dark/light rendering |
 | `r` / `R` | Reload the active document |
@@ -61,6 +63,10 @@ In lists, `j`/`k` or arrows select, Enter activates, and `/` starts a case-insen
 
 The active file is checked for changes every 750 ms. Failed reloads retain the previous rendering; edit again or press `r` to retry. A successful reload closes an open outline to discard stale heading selections. Theme changes and reloads re-typeset synchronously; zoom resamples the cached vector canvas without rerunning Pandoc or Typst. Inactive tabs reload when activated.
 
+Smooth scrolling follows `pdfterm`'s 16 ms eased steps, with immediate reversal and no queued animation backlog. Jumps, search, tab changes, and modal panes cancel unfinished movement. Nearby scrolling reuses a raster bounded to the viewport width and up to three viewport heights, capped at 10,000 pixels high for Kitty/Ghostty compatibility; distant movement replaces it without first deleting the visible image.
+
+The status line shows measured frame work and a `cache` indicator. Press `p` for SVG rendering, PNG/base64 encoding, and terminal-output/flush timings. Cached movements skip rendering and encoding. These measurements describe application work, not terminal-emulator display latency.
+
 ## Math
 
 Use `$E = mc^2$` for inline math and `$$...$$` on separate lines for display math. Fractions, Greek letters, integrals, matrices, and other supported TeX expressions are converted by Pandoc to Typst math. This is not a full LaTeX engine: custom packages/macros and unsupported commands follow Pandoc's conversion limitations.
@@ -74,3 +80,4 @@ Use `$E = mc^2$` for inline math and `$$...$$` on separate lines for display mat
 - Source metadata, raw HTML, and styling attributes are not used as executable layout instructions. Raw Typst/TeX blocks are displayed as code. Unsupported math follows Pandoc's conversion behavior. Code blocks are monospaced without syntax highlighting.
 - Private rendering files are removed after layout; the cached vector document stays in memory. Exported PNGs are retained.
 - Terminal pixel dimensions come from the terminal window size; when unavailable, the viewer assumes 8×16-pixel cells.
+- Drawable terminal heights above 10,000 pixels are rejected rather than sending an image the terminal cannot display.

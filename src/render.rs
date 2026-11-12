@@ -7,6 +7,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 pub struct RenderOptions {
     pub dark: bool,
@@ -28,6 +29,12 @@ pub struct Document {
     tree: usvg::Tree,
 }
 
+pub struct Raster {
+    pub png: Vec<u8>,
+    pub render_elapsed: Duration,
+    pub encode_elapsed: Duration,
+}
+
 impl Document {
     pub fn dimensions(&self, ppi: u32) -> (u32, u32) {
         let scale = f64::from(ppi) / 72.0;
@@ -37,7 +44,7 @@ impl Document {
         )
     }
 
-    pub fn rasterize(&self, ppi: u32, x: u32, y: u32, width: u32, height: u32) -> Result<Vec<u8>> {
+    pub fn rasterize(&self, ppi: u32, x: u32, y: u32, width: u32, height: u32) -> Result<Raster> {
         ensure!(ppi > 0, "render resolution must be greater than zero");
         let (canvas_width, canvas_height) = self.dimensions(ppi);
         ensure!(
@@ -47,15 +54,23 @@ impl Document {
                 && u64::from(y) + u64::from(height) <= u64::from(canvas_height),
             "raster region is outside the document canvas"
         );
+        let render_started = Instant::now();
         let mut pixels =
             tiny_skia::Pixmap::new(width, height).context("cannot allocate document viewport")?;
         let scale = ppi as f32 / 72.0;
         let transform =
             tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, -(x as f32), -(y as f32));
         resvg::render(&self.tree, transform, &mut pixels.as_mut());
-        pixels
+        let render_elapsed = render_started.elapsed();
+        let encode_started = Instant::now();
+        let png = pixels
             .encode_png()
-            .context("cannot encode document viewport")
+            .context("cannot encode document viewport")?;
+        Ok(Raster {
+            png,
+            render_elapsed,
+            encode_elapsed: encode_started.elapsed(),
+        })
     }
 }
 
@@ -225,14 +240,14 @@ pub fn export(path: &Path, output: &Path, options: RenderOptions) -> Result<()> 
     let ppi = options.ppi;
     let document = render(path, options)?;
     let (width, height) = document.dimensions(ppi);
-    let png = document.rasterize(ppi, 0, 0, width, height)?;
+    let raster = document.rasterize(ppi, 0, 0, width, height)?;
     let mut destination = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(output)
         .with_context(|| format!("cannot create export {}", output.display()))?;
     let written = (|| -> io::Result<()> {
-        destination.write_all(&png)?;
+        destination.write_all(&raster.png)?;
         destination.sync_all()
     })();
     if let Err(error) = written {
@@ -616,12 +631,53 @@ mod tests {
         };
         assert_eq!(document.dimensions(72), (72, 144));
         assert_eq!(document.dimensions(144), (144, 288));
-        let png = document.rasterize(144, 36, 144, 36, 36).unwrap();
-        let pixels = image::load_from_memory(&png).unwrap().to_rgba8();
+        let raster = document.rasterize(144, 36, 144, 36, 36).unwrap();
+        let pixels = image::load_from_memory(&raster.png).unwrap().to_rgba8();
         assert_eq!(pixels.dimensions(), (36, 36));
         assert_eq!(pixels.get_pixel(18, 18).0, [255, 0, 0, 255]);
         assert!(document.rasterize(144, 144, 0, 1, 1).is_err());
         assert!(document.rasterize(0, 0, 0, 1, 1).is_err());
+    }
+
+    #[test]
+    fn distant_clipped_regions_keep_document_pixel_coordinates() {
+        let mut svg = String::from(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="144pt" height="150144pt" viewBox="0 0 144 150144"><defs><clipPath id="page"><rect width="144" height="150144"/></clipPath><clipPath id="tile"><rect width="72" height="72"/></clipPath></defs><g clip-path="url(#page)"><rect width="144" height="150144" fill="white"/>"##,
+        );
+        for y in [24, 50024, 150024] {
+            svg.push_str(&format!(
+                r##"<g transform="translate(24 {y})" clip-path="url(#tile)"><rect width="72" height="72" fill="#ff0000"/><path d="M 18 18 H 54 V 54 H 18 Z" fill="#00ff00"/></g>"##,
+            ));
+        }
+        svg.push_str("</g></svg>");
+        let tree = usvg::Tree::from_str(
+            &svg,
+            &usvg::Options {
+                dpi: 72.0,
+                ..usvg::Options::default()
+            },
+        )
+        .unwrap();
+        let document = Document {
+            path: PathBuf::new(),
+            entries: Vec::new(),
+            tree,
+        };
+        // Visit far-apart regions and then jump back, at both native and
+        // startup resolutions. Neither a full-document pixmap nor cache reuse
+        // may affect the coordinates passed into resvg's clip transforms.
+        for ppi in [72, 240] {
+            let scale = ppi / 24;
+            for y in [50024, 24, 150024, 50024] {
+                let raster = document
+                    .rasterize(ppi, 8 * scale, y * scale / 3, 24 * scale, 24 * scale)
+                    .unwrap();
+                let pixels = image::load_from_memory(&raster.png).unwrap().to_rgba8();
+                assert_eq!(pixels.dimensions(), (24 * scale, 24 * scale));
+                assert_eq!(pixels.get_pixel(scale, scale).0, [255, 0, 0, 255]);
+                assert_eq!(pixels.get_pixel(12 * scale, 12 * scale).0, [0, 255, 0, 255]);
+            }
+        }
     }
 
     #[test]
