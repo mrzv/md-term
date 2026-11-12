@@ -47,12 +47,11 @@ impl Document {
         ensure!(ppi > 0, "render resolution must be greater than zero");
         let (canvas_width, canvas_height) = self.dimensions(ppi);
         ensure!(
-            width > 0
-                && height > 0
-                && u64::from(x) + u64::from(width) <= u64::from(canvas_width)
-                && u64::from(y) + u64::from(height) <= u64::from(canvas_height),
-            "raster region is outside the document canvas"
+            width > 0 && height > 0 && x < canvas_width && y < canvas_height,
+            "raster region must start inside the document canvas"
         );
+        // Cell-aligned strip placements may need transparent right/bottom padding.
+        // Render directly into the padded region instead of copying its pixels.
         let render_started = Instant::now();
         let mut pixels =
             tiny_skia::Pixmap::new(width, height).context("cannot allocate document viewport")?;
@@ -60,6 +59,18 @@ impl Document {
         let transform =
             tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, -(x as f32), -(y as f32));
         resvg::render(&self.tree, transform, &mut pixels.as_mut());
+        // resvg also draws content overflowing the SVG page. Keep that content
+        // clipped to the original canvas, not exposed in cell-alignment padding.
+        let visible_width = width.min(canvas_width - x) as usize * 4;
+        let visible_height = height.min(canvas_height - y) as usize;
+        let stride = width as usize * 4;
+        let (inside, bottom) = pixels.data_mut().split_at_mut(visible_height * stride);
+        bottom.fill(0);
+        if visible_width < stride {
+            for row in inside.chunks_exact_mut(stride) {
+                row[visible_width..].fill(0);
+            }
+        }
         let render_elapsed = render_started.elapsed();
         Ok(Raster {
             pixels,
@@ -615,7 +626,7 @@ mod tests {
     #[test]
     fn rasterization_scales_points_and_allocates_only_requested_region() {
         let tree = usvg::Tree::from_str(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="72pt" height="144pt" viewBox="0 0 72 144"><rect width="72" height="144" fill="white"/><rect x="18" y="72" width="18" height="18" fill="#ff0000"/></svg>"##,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="72pt" height="144pt" viewBox="0 0 72 144"><rect width="84" height="156" fill="white"/><rect x="18" y="72" width="18" height="18" fill="#ff0000"/></svg>"##,
             &usvg::Options {
                 dpi: 72.0,
                 ..usvg::Options::default()
@@ -634,6 +645,11 @@ mod tests {
         assert_eq!(raster.pixels.pixel(18, 18).unwrap().demultiply().red(), 255);
         assert_eq!(raster.pixels.pixel(18, 18).unwrap().demultiply().green(), 0);
         assert_eq!(raster.pixels.pixel(18, 18).unwrap().alpha(), 255);
+        let padded = document.rasterize(144, 140, 284, 12, 12).unwrap();
+        // The background extends past both page edges, but padding stays clear.
+        assert_eq!(padded.pixels.pixel(3, 3).unwrap().alpha(), 255);
+        assert_eq!(padded.pixels.pixel(4, 3).unwrap().alpha(), 0);
+        assert_eq!(padded.pixels.pixel(3, 4).unwrap().alpha(), 0);
         assert!(document.rasterize(144, 144, 0, 1, 1).is_err());
         assert!(document.rasterize(0, 0, 0, 1, 1).is_err());
     }

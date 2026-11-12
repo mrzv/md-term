@@ -63,7 +63,9 @@ In lists, `j`/`k` or arrows select, Enter activates, and `/` starts a case-insen
 
 The active file is checked for changes every 750 ms. Failed reloads retain the previous rendering; edit again or press `r` to retry. A successful reload closes an open outline to discard stale heading selections. Theme changes and reloads re-typeset synchronously; zoom resamples the cached vector canvas without rerunning Pandoc or Typst. Inactive tabs reload when activated.
 
-Smooth scrolling follows `pdfterm`'s 16 ms eased steps, with immediate reversal and no queued animation backlog. Jumps, search, tab changes, and modal panes cancel unfinished movement. A single background worker rasterizes and encodes reusable, aligned strips up to 256 pixels high and 1,048,576 pixels each (4 MiB decoded RGBA). The bounded cache normally keeps the visible area, two viewports ahead, and one behind; crossing a strip boundary reuses existing images instead of rebuilding the viewport. Uploads are interleaved with input outside synchronized drawing. Cold jumps retain the previous complete view until the replacement is ready; obsolete queued work is discarded.
+Smooth scrolling follows `pdfterm`'s 16 ms eased steps, with immediate reversal and no queued animation backlog. Jumps, search, tab changes, and modal panes cancel unfinished movement. A single background worker rasterizes and encodes reusable strips, targeting 256 logical rows and 1,048,576 pixels per image. Cell-sized raster bleed and transparent edge padding let adjacent strips occupy exclusive whole-cell rectangles without scaling or overlap, including through Herdr. Scroll positions remain pixel-exact. Each image stays within the 4,194,304-pixel transport limit (16 MiB decoded RGBA).
+
+The bounded cache normally keeps the visible area, two viewports ahead, and one behind; crossing a strip boundary reuses existing images instead of rebuilding the viewport. Uploads are interleaved with input outside synchronized drawing. Cold jumps retain the previous complete view until the replacement is ready; obsolete queued work is discarded.
 
 The status line shows main-thread frame work and a `cache` indicator when the visible strips are ready. Press `p` for the latest background strip's SVG rendering and PNG/base64 encoding times, plus main-thread upload and terminal-output/flush timings. Background work is not charged to frame time. These measurements describe application work, not terminal-emulator display latency.
 
@@ -80,4 +82,4 @@ Use `$E = mc^2$` for inline math and `$$...$$` on separate lines for display mat
 - Source metadata, raw HTML, and styling attributes are not used as executable layout instructions. Raw Typst/TeX blocks are displayed as code. Unsupported math follows Pandoc's conversion behavior. Code blocks are monospaced without syntax highlighting.
 - Private rendering files are removed after layout; the cached vector document stays in memory. Exported PNGs are retained.
 - Terminal pixel dimensions come from the terminal window size; when unavailable, the viewer assumes 8×16-pixel cells.
-- Drawable terminal heights above 10,000 pixels are rejected rather than sending an image the terminal cannot display.
+- Drawable terminal heights and cell widths above 10,000 pixels, or individual cells above 4,194,304 pixels, exceed the graphics transport limits and are rejected.

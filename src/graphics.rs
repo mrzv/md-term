@@ -69,6 +69,11 @@ pub fn viewport(top: u16) -> Result<Viewport> {
     if height > MAX_IMAGE_DIMENSION {
         bail!("terminal drawable height exceeds the {MAX_IMAGE_DIMENSION}-pixel graphics limit");
     }
+    if cell_width > MAX_IMAGE_DIMENSION
+        || u64::from(cell_width) * u64::from(cell_height) > u64::from(MAX_IMAGE_PIXELS)
+    {
+        bail!("a terminal cell exceeds the per-image graphics limit");
+    }
     Ok(Viewport {
         columns,
         rows,
