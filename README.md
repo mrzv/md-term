@@ -2,7 +2,7 @@
 
 Graphical Markdown viewer for Kitty, Ghostty, and WezTerm. Its Tokyo Night Moon chrome, conditional tab bar, status line, and centered pickers follow `pdfterm` and `office-term`. The executable is `mdterm`.
 
-Pandoc parses Markdown; Typst lays out one continuous, auto-height vector canvas. A bounded region around the viewport is rasterized for the Kitty graphics protocol—there are no page breaks or page navigation. Headings, tables, lists, code, local images, and inline/display TeX math render as a document rather than terminal text.
+Pandoc parses Markdown; Typst lays out one continuous, auto-height vector canvas. Bounded horizontal strips around the viewport are rasterized for the Kitty graphics protocol—there are no page breaks or page navigation. Headings, tables, lists, code, local images, and inline/display TeX math render as a document rather than terminal text.
 
 ## Install
 
@@ -39,7 +39,7 @@ mdterm --export document.png README.md
 | `h` / `l`, left/right | Pan horizontally |
 | Space / PageDown; Backspace / PageUp | Scroll 85% of the viewport forward/backward |
 | `S` | Toggle smooth scrolling (enabled by default) |
-| `p` | Toggle detailed render / encode / output profiling |
+| `p` | Toggle detailed background render / encode / upload / output profiling |
 | `g` / `G`, Home / End | Document top / bottom |
 | `:` | Jump to a percentage (0–100) |
 | `/` | Search rendered text blocks, case-insensitively |
@@ -63,9 +63,9 @@ In lists, `j`/`k` or arrows select, Enter activates, and `/` starts a case-insen
 
 The active file is checked for changes every 750 ms. Failed reloads retain the previous rendering; edit again or press `r` to retry. A successful reload closes an open outline to discard stale heading selections. Theme changes and reloads re-typeset synchronously; zoom resamples the cached vector canvas without rerunning Pandoc or Typst. Inactive tabs reload when activated.
 
-Smooth scrolling follows `pdfterm`'s 16 ms eased steps, with immediate reversal and no queued animation backlog. Jumps, search, tab changes, and modal panes cancel unfinished movement. Nearby scrolling reuses a raster up to three viewport heights, capped at 10,000 pixels high and a 4,194,304-pixel overscan budget. Large viewports are split into horizontal image bands, each at most 16 MiB of decoded RGBA, so relays such as Herdr do not drop an oversized graphics frame. Replacements are placed before the previous image bands are deleted.
+Smooth scrolling follows `pdfterm`'s 16 ms eased steps, with immediate reversal and no queued animation backlog. Jumps, search, tab changes, and modal panes cancel unfinished movement. A single background worker rasterizes and encodes reusable, aligned strips up to 256 pixels high and 1,048,576 pixels each (4 MiB decoded RGBA). The bounded cache normally keeps the visible area, two viewports ahead, and one behind; crossing a strip boundary reuses existing images instead of rebuilding the viewport. Uploads are interleaved with input outside synchronized drawing. Cold jumps retain the previous complete view until the replacement is ready; obsolete queued work is discarded.
 
-The status line shows measured frame work and a `cache` indicator. Press `p` for SVG rendering, PNG/base64 encoding, and terminal-output/flush timings. Cached movements skip rendering and encoding. These measurements describe application work, not terminal-emulator display latency.
+The status line shows main-thread frame work and a `cache` indicator when the visible strips are ready. Press `p` for the latest background strip's SVG rendering and PNG/base64 encoding times, plus main-thread upload and terminal-output/flush timings. Background work is not charged to frame time. These measurements describe application work, not terminal-emulator display latency.
 
 ## Math
 

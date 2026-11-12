@@ -1,5 +1,7 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -21,13 +23,20 @@ pub const MAX_IMAGE_DIMENSION: u32 = 10_000;
 // Herdr forwards decoded RGBA assets, not compressed PNGs. Stay within its
 // 16 MiB native-file budget and below its 32 MiB inline frame limit.
 pub const MAX_IMAGE_PIXELS: u32 = 4 * 1024 * 1024;
-const MAX_TILES: u32 = MAX_IMAGE_DIMENSION.div_ceil(MAX_IMAGE_PIXELS / MAX_IMAGE_DIMENSION);
-// The low bit selects one of two terminal image slots; the remaining bits
-// identify the raster generation. Keep the old placement until its replacement
-// has finished uploading, then release its pixels.
-static NEXT_FRAME: AtomicU64 = AtomicU64::new(2);
-static UPLOADED_FRAME: AtomicU64 = AtomicU64::new(0);
-static UPLOADED_TILES: AtomicU32 = AtomicU32::new(0);
+static NEXT_FRAME: AtomicU32 = AtomicU32::new(1);
+
+#[derive(Default)]
+struct Images {
+    // Incomplete uploads remain owned so terminal teardown can remove them.
+    uploaded: HashMap<u32, bool>,
+    visible: Vec<u32>,
+}
+
+thread_local! {
+    // Only terminal-output operations touch this registry. Raster/PNG workers
+    // construct Frames without accessing terminal state.
+    static IMAGES: RefCell<Images> = RefCell::new(Images::default());
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Viewport {
@@ -83,7 +92,7 @@ impl TerminalGuard {
         terminal::enable_raw_mode().context("enabling terminal raw mode")?;
         // Construct before any fallible output so partial initialization is cleaned up.
         let guard = Self;
-        UPLOADED_FRAME.store(0, Ordering::Relaxed);
+        IMAGES.with_borrow_mut(|images| *images = Images::default());
         let mut out = io::stdout();
         execute!(
             out,
@@ -101,11 +110,11 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        UPLOADED_FRAME.store(0, Ordering::Relaxed);
+        let images = IMAGES.with_borrow_mut(std::mem::take);
         // Restore input first, even if writing to a disconnected terminal fails.
         let _ = terminal::disable_raw_mode();
         let mut out = io::stdout();
-        for image_id in 1..=2 * MAX_TILES {
+        for image_id in images.uploaded.keys() {
             let _ = write!(out, "\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\");
         }
         let _ = execute!(
@@ -120,27 +129,24 @@ impl Drop for TerminalGuard {
     }
 }
 
-struct Tile {
-    y: u32,
-    height: u32,
-    encoded_png: String,
-}
-
+/// One independently encoded and reusable document strip.
 pub struct Frame {
     pub width: u32,
     pub height: u32,
-    tiles: Vec<Tile>,
-    generation: u64,
+    encoded_png: String,
+    id: u32,
 }
 
 impl Frame {
-    /// Encodes bounded horizontal bands without copying the raster into tiles.
+    /// Encodes a single bounded strip, off the terminal-output path.
     pub fn from_pixels(pixels: tiny_skia::Pixmap) -> Result<Self> {
         let (width, height) = (pixels.width(), pixels.height());
         if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
-            bail!("viewport image exceeds the {MAX_IMAGE_DIMENSION}-pixel graphics limit");
+            bail!("strip image exceeds the {MAX_IMAGE_DIMENSION}-pixel graphics limit");
         }
-        let tile_height = (MAX_IMAGE_PIXELS / width).min(MAX_IMAGE_DIMENSION);
+        if u64::from(width) * u64::from(height) > u64::from(MAX_IMAGE_PIXELS) {
+            bail!("strip image exceeds the {MAX_IMAGE_PIXELS}-pixel graphics budget");
+        }
         let mut data = pixels.take();
         // PNG stores straight alpha; tiny-skia renders premultiplied pixels.
         for pixel in data.chunks_exact_mut(4) {
@@ -153,40 +159,74 @@ impl Frame {
                 pixel.copy_from_slice(&[color.red(), color.green(), color.blue(), color.alpha()]);
             }
         }
-        let mut tiles = Vec::with_capacity(height.div_ceil(tile_height) as usize);
-        for y in (0..height).step_by(tile_height as usize) {
-            let band_height = tile_height.min(height - y);
-            let start = y as usize * width as usize * 4;
-            let end = start + band_height as usize * width as usize * 4;
-            let mut png = Vec::new();
-            image::codecs::png::PngEncoder::new_with_quality(
-                &mut png,
-                image::codecs::png::CompressionType::Fast,
-                image::codecs::png::FilterType::Adaptive,
-            )
-            .write_image(
-                &data[start..end],
-                width,
-                band_height,
-                image::ExtendedColorType::Rgba8,
-            )
-            .context("encoding viewport image tile")?;
-            tiles.push(Tile {
-                y,
-                height: band_height,
-                encoded_png: STANDARD.encode(png),
-            });
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new_with_quality(
+            &mut png,
+            image::codecs::png::CompressionType::Fast,
+            image::codecs::png::FilterType::Adaptive,
+        )
+        .write_image(&data, width, height, image::ExtendedColorType::Rgba8)
+        .context("encoding document strip")?;
+        let mut id = NEXT_FRAME.load(Ordering::Relaxed);
+        loop {
+            let next = id.checked_add(1).context("terminal image IDs exhausted")?;
+            match NEXT_FRAME.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(current) => id = current,
+            }
         }
         Ok(Self {
             width,
             height,
-            tiles,
-            generation: NEXT_FRAME.fetch_add(2, Ordering::Relaxed),
+            encoded_png: STANDARD.encode(png),
+            id,
         })
     }
 
-    /// Places the visible intersections of bounded image bands at native scale.
-    pub fn draw(&self, out: &mut impl Write, view: Viewport, x: u32, y: u32) -> Result<()> {
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// Uploads pixels without changing any placements. Returns false on reuse.
+    pub fn upload(&self, out: &mut impl Write) -> Result<bool> {
+        let resident = IMAGES.with_borrow(|images| images.uploaded.get(&self.id) == Some(&true));
+        if resident {
+            return Ok(false);
+        }
+        IMAGES.with_borrow_mut(|images| images.uploaded.insert(self.id, false));
+        let mut chunks = self
+            .encoded_png
+            .as_bytes()
+            .chunks(PAYLOAD_CHUNK_SIZE)
+            .peekable();
+        write!(
+            out,
+            "\x1b_Ga=t,i={},q=2,t=d,f=100,m={};",
+            self.id,
+            u8::from(chunks.len() > 1),
+        )?;
+        while let Some(chunk) = chunks.next() {
+            out.write_all(chunk)?;
+            out.write_all(b"\x1b\\")?;
+            if chunks.peek().is_some() {
+                write!(out, "\x1b_Gq=2,m={};", u8::from(chunks.len() > 1))?;
+            }
+        }
+        IMAGES.with_borrow_mut(|images| images.uploaded.insert(self.id, true));
+        Ok(true)
+    }
+
+    /// Places a strip intersection at native scale inside the drawable viewport.
+    /// Uploads must be explicit; this path never encodes or transmits pixels.
+    pub fn place(
+        &self,
+        out: &mut impl Write,
+        view: Viewport,
+        source_y: u32,
+        height: u32,
+        destination_y: u32,
+        left: u32,
+    ) -> Result<()> {
         if view.columns == 0
             || view.rows <= view.top.saturating_add(1)
             || view.width == 0
@@ -194,124 +234,72 @@ impl Frame {
         {
             bail!("cannot draw into an empty viewport");
         }
-        let crop = crop(self.width, self.height, view, x, y);
+        let height = height
+            .min(self.height.saturating_sub(source_y))
+            .min(view.height.saturating_sub(destination_y));
+        let width = self.width.min(view.width.saturating_sub(left));
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        if !IMAGES.with_borrow(|images| images.uploaded.get(&self.id) == Some(&true)) {
+            bail!("document strip must be uploaded before placement");
+        }
         let cell_width = (view.width / u32::from(view.columns)).max(1);
         let cell_height = (view.height / u32::from(view.rows - view.top - 1)).max(1);
-        let previous = UPLOADED_FRAME.load(Ordering::Relaxed);
-        let previous_tiles = UPLOADED_TILES.load(Ordering::Relaxed);
-        let cached = previous & !1 == self.generation;
-        let slot = if cached {
-            previous & 1
-        } else {
-            (previous & 1) ^ 1
-        };
-        if !cached {
-            UPLOADED_FRAME.store(0, Ordering::Relaxed);
+        execute!(
+            out,
+            MoveTo(
+                (left / cell_width) as u16,
+                view.top + (destination_y / cell_height) as u16,
+            )
+        )?;
+        write!(
+            out,
+            "\x1b_Ga=p,i={},p=1,x=0,y={source_y},w={width},h={height},X={},Y={},C=1,q=2\x1b\\",
+            self.id,
+            left % cell_width,
+            destination_y % cell_height,
+        )?;
+        IMAGES.with_borrow_mut(|images| {
+            if !images.visible.contains(&self.id) {
+                images.visible.push(self.id);
+            }
+        });
+        Ok(())
+    }
+
+    /// Explicitly evicts only this strip. Dropping a Frame never writes output.
+    pub fn release(&self, out: &mut impl Write) -> io::Result<()> {
+        if !IMAGES.with_borrow(|images| images.uploaded.contains_key(&self.id)) {
+            return Ok(());
         }
-        for (index, tile) in self.tiles.iter().enumerate() {
-            let image_id = 1 + slot + index as u64 * 2;
-            let top = crop.y.max(tile.y);
-            let bottom = (crop.y + crop.height).min(tile.y + tile.height);
-            let visible = top < bottom;
-            if visible {
-                let destination_y = crop.top + top - crop.y;
-                execute!(
-                    out,
-                    MoveTo(
-                        (crop.left / cell_width) as u16,
-                        view.top + (destination_y / cell_height) as u16,
-                    )
-                )?;
-                write!(
-                    out,
-                    "\x1b_Ga={},i={image_id},p=1,x={},y={},w={},h={},X={},Y={},C=1,q=2",
-                    if cached { "p" } else { "T" },
-                    crop.x,
-                    top - tile.y,
-                    crop.width,
-                    bottom - top,
-                    crop.left % cell_width,
-                    destination_y % cell_height,
-                )?;
-            } else if !cached {
-                write!(out, "\x1b_Ga=t,i={image_id},q=2")?;
-            } else {
-                continue;
-            }
-            if cached {
-                out.write_all(b"\x1b\\")?;
-            } else {
-                let mut chunks = tile
-                    .encoded_png
-                    .as_bytes()
-                    .chunks(PAYLOAD_CHUNK_SIZE)
-                    .peekable();
-                write!(out, ",t=d,f=100,m={};", u8::from(chunks.len() > 1))?;
-                while let Some(chunk) = chunks.next() {
-                    out.write_all(chunk)?;
-                    out.write_all(b"\x1b\\")?;
-                    if chunks.peek().is_some() {
-                        write!(out, "\x1b_Gq=2,m={};", u8::from(chunks.len() > 1))?;
-                    }
-                }
-            }
-        }
-        // Place every replacement before removing any previous placement.
-        if !cached && previous != 0 {
-            for index in 0..previous_tiles {
-                let image_id = 1 + (previous & 1) + u64::from(index) * 2;
-                write!(out, "\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\")?;
-            }
-        } else if cached {
-            for (index, tile) in self.tiles.iter().enumerate() {
-                if tile.y >= crop.y + crop.height || tile.y + tile.height <= crop.y {
-                    let image_id = 1 + slot + index as u64 * 2;
-                    write!(out, "\x1b_Ga=d,d=i,i={image_id},q=2\x1b\\")?;
-                }
-            }
-        }
-        out.flush()?;
-        UPLOADED_TILES.store(self.tiles.len() as u32, Ordering::Relaxed);
-        UPLOADED_FRAME.store(self.generation | slot, Ordering::Relaxed);
+        write!(out, "\x1b_Ga=d,d=I,i={},q=2\x1b\\", self.id)?;
+        IMAGES.with_borrow_mut(|images| {
+            images.uploaded.remove(&self.id);
+            images.visible.retain(|&id| id != self.id);
+        });
         Ok(())
     }
 }
 
-/// Removes placements only; cached image pixels remain available to Frame::draw.
-pub fn clear(out: &mut impl Write) -> io::Result<()> {
-    placements_clear(out)
-}
-
-pub fn placements_clear(out: &mut impl Write) -> io::Result<()> {
-    let uploaded = UPLOADED_FRAME.load(Ordering::Relaxed);
-    if uploaded != 0 {
-        for index in 0..UPLOADED_TILES.load(Ordering::Relaxed) {
-            let image_id = 1 + (uploaded & 1) + u64::from(index) * 2;
-            write!(out, "\x1b_Ga=d,d=i,i={image_id},q=2\x1b\\")?;
+/// Removes old placements only after the caller has placed every replacement.
+/// Uploaded strip pixels stay resident for scrolling in either direction.
+pub fn finish_frame(out: &mut impl Write, visible: &[u32]) -> io::Result<()> {
+    let count = IMAGES.with_borrow(|images| images.visible.len());
+    for index in 0..count {
+        let id = IMAGES.with_borrow(|images| images.visible[index]);
+        if !visible.contains(&id) {
+            write!(out, "\x1b_Ga=d,d=i,i={id},q=2\x1b\\")?;
         }
     }
+    IMAGES.with_borrow_mut(|images| images.visible.retain(|id| visible.contains(id)));
+    Ok(())
+}
+
+/// Hides the document for a popup without evicting reusable image pixels.
+pub fn clear(out: &mut impl Write) -> io::Result<()> {
+    finish_frame(out, &[])?;
     out.flush()
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct Crop {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-    left: u32,
-    top: u32,
-}
-
-fn crop(width: u32, height: u32, view: Viewport, x: u32, y: u32) -> Crop {
-    Crop {
-        x: x.min(width.saturating_sub(view.width)),
-        y: y.min(height.saturating_sub(view.height)),
-        width: width.min(view.width),
-        height: height.min(view.height),
-        left: view.width.saturating_sub(width) / 2,
-        top: view.height.saturating_sub(height) / 2,
-    }
 }
 
 #[cfg(test)]
@@ -328,90 +316,68 @@ mod tests {
         }
     }
 
-    #[test]
-    fn oversized_crop_clamps_at_both_edges() {
-        assert_eq!(
-            crop(1200, 1600, view(), u32::MAX, u32::MAX),
-            Crop {
-                x: 400,
-                y: 1120,
-                width: 800,
-                height: 480,
-                left: 0,
-                top: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn small_image_ignores_scroll_and_centers_without_scaling() {
-        assert_eq!(
-            crop(301, 201, view(), 10, 20),
-            Crop {
-                x: 0,
-                y: 0,
-                width: 301,
-                height: 201,
-                left: 249,
-                top: 139,
-            }
-        );
-    }
-
-    #[test]
-    fn exact_fit_never_reaches_reserved_rows() {
-        assert_eq!(
-            crop(800, 480, view(), 1, 1),
-            Crop {
-                x: 0,
-                y: 0,
-                width: 800,
-                height: 480,
-                left: 0,
-                top: 0,
-            }
-        );
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct Placement {
+        source: (u32, u32),
+        size: (u32, u32),
+        cell: (u32, u32),
+        offset: (u32, u32),
     }
 
     #[derive(Default)]
     struct TerminalImages {
-        images: std::collections::HashMap<u64, image::RgbaImage>,
-        placements: std::collections::HashMap<u64, (u32, u32, u32, u32)>,
-        pending: Option<(u64, Option<(u32, u32, u32, u32)>, String)>,
+        images: HashMap<u32, image::RgbaImage>,
+        placements: HashMap<u32, Placement>,
+        pending: Option<(u32, String)>,
+        cursor: (u32, u32),
         uploads: usize,
+        chunks: usize,
     }
 
     impl TerminalImages {
         fn apply(&mut self, output: &[u8], must_remain_visible: bool) {
             for command in output.split(|byte| *byte == 0x1b) {
+                if let Some(cursor) = command
+                    .strip_prefix(b"[")
+                    .and_then(|cursor| cursor.strip_suffix(b"H"))
+                {
+                    let cursor = std::str::from_utf8(cursor).unwrap();
+                    let (row, column) = cursor.split_once(';').unwrap();
+                    self.cursor = (
+                        column.parse::<u32>().unwrap() - 1,
+                        row.parse::<u32>().unwrap() - 1,
+                    );
+                    continue;
+                }
                 let Some(command) = command.strip_prefix(b"_G") else {
                     continue;
                 };
                 let command = std::str::from_utf8(command).unwrap();
                 let (control, payload) = command.split_once(';').unwrap_or((command, ""));
-                let fields: std::collections::HashMap<_, _> = control
+                let fields: HashMap<_, _> = control
                     .split(',')
                     .filter_map(|field| field.split_once('='))
                     .collect();
-                let number = |key| fields.get(key).unwrap_or(&"0").parse::<u64>().unwrap();
+                let number = |key| fields.get(key).unwrap_or(&"0").parse::<u32>().unwrap();
                 let id = number("i");
-                let area = (
-                    number("x") as u32,
-                    number("y") as u32,
-                    number("w") as u32,
-                    number("h") as u32,
-                );
                 match fields.get("a").copied() {
-                    Some("T") | Some("t") => {
+                    Some("t") => {
                         self.images.remove(&id);
                         self.placements.remove(&id);
-                        let placement = (fields.get("a") == Some(&"T")).then_some(area);
-                        self.pending = Some((id, placement, String::new()));
+                        self.pending = Some((id, String::new()));
                         self.uploads += 1;
                     }
                     Some("p") => {
-                        assert!(self.images.contains_key(&id), "placing missing pixels");
-                        self.placements.insert(id, area);
+                        let pixels = self.images.get(&id).expect("placing missing pixels");
+                        let placement = Placement {
+                            source: (number("x"), number("y")),
+                            size: (number("w"), number("h")),
+                            cell: self.cursor,
+                            offset: (number("X"), number("Y")),
+                        };
+                        assert!(placement.source.0 + placement.size.0 <= pixels.width());
+                        assert!(placement.source.1 + placement.size.1 <= pixels.height());
+                        self.placements.insert(id, placement);
                     }
                     Some("d") => {
                         assert!(self.pending.is_none(), "deletion aborts a chunked upload");
@@ -420,154 +386,251 @@ mod tests {
                             self.images.remove(&id);
                         }
                     }
-                    _ => {}
+                    Some(action) => panic!("unexpected graphics action {action}"),
+                    None => {}
                 }
-                if let Some((_, _, data)) = &mut self.pending {
+                if let Some((_, data)) = &mut self.pending {
                     data.push_str(payload);
+                    self.chunks += 1;
                     if number("m") == 0 {
-                        let (id, area, data) = self.pending.take().unwrap();
+                        let (id, data) = self.pending.take().unwrap();
                         let png = STANDARD.decode(data).unwrap();
                         let pixels = image::load_from_memory(&png).unwrap().to_rgba8();
-                        assert!(pixels.width() * pixels.height() <= MAX_IMAGE_PIXELS);
+                        assert!(pixels.width() <= MAX_IMAGE_DIMENSION);
+                        assert!(pixels.height() <= MAX_IMAGE_DIMENSION);
+                        assert!(
+                            u64::from(pixels.width()) * u64::from(pixels.height())
+                                <= u64::from(MAX_IMAGE_PIXELS)
+                        );
                         self.images.insert(id, pixels);
-                        if let Some(area) = area {
-                            self.placements.insert(id, area);
-                        }
                     }
                 }
                 if must_remain_visible {
                     assert!(!self.placements.is_empty(), "redraw exposed a blank canvas");
                 }
-                assert!(
-                    self.images.len() <= (2 * MAX_TILES) as usize,
-                    "unbounded terminal raster storage"
-                );
             }
-        }
-
-        fn visible_pixel(&self) -> [u8; 4] {
-            let (id, &(x, y, _, _)) = self.placements.iter().next().unwrap();
-            self.images[id].get_pixel(x, y).0
         }
     }
 
+    fn strip(seed: u32) -> (Frame, image::RgbaImage) {
+        let mut pixels = tiny_skia::Pixmap::new(64, 256).unwrap();
+        let mut state = seed;
+        for pixel in pixels.data_mut().chunks_exact_mut(4) {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            pixel.copy_from_slice(&[
+                (state >> 24) as u8,
+                (state >> 16) as u8,
+                (state >> 8) as u8,
+                255,
+            ]);
+        }
+        let expected = image::RgbaImage::from_raw(64, 256, pixels.data().to_vec()).unwrap();
+        (Frame::from_pixels(pixels).unwrap(), expected)
+    }
+
     #[test]
-    fn replacements_and_cached_crops_keep_pixels_visible_and_bounded() {
-        let make_frame = |seed: u32| {
-            let mut pixels = resvg::tiny_skia::Pixmap::new(64, 960).unwrap();
-            let mut state = seed;
-            for pixel in pixels.data_mut().chunks_exact_mut(4) {
-                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-                pixel.copy_from_slice(&[
-                    (state >> 24) as u8,
-                    (state >> 16) as u8,
-                    (state >> 8) as u8,
-                    255,
-                ]);
-            }
-            let png = pixels.encode_png().unwrap();
-            let first = image::load_from_memory(&png).unwrap().to_rgba8();
-            let frame = Frame::from_pixels(pixels).unwrap();
-            (frame, first)
-        };
-        let (first, first_pixels) = make_frame(1);
-        let (second, second_pixels) = make_frame(2);
+    fn independent_strips_survive_scroll_replacement_eviction_and_popup() {
+        let (first, first_pixels) = strip(1);
+        let (second, second_pixels) = strip(2);
+        let (ahead, _) = strip(3);
+        assert_ne!(first.id(), second.id());
+        assert_ne!(second.id(), ahead.id());
         let mut terminal = TerminalImages::default();
         let mut output = Vec::new();
-        UPLOADED_FRAME.store(0, Ordering::Relaxed);
-
-        first.draw(&mut output, view(), 0, 0).unwrap();
-        terminal.apply(&output, false);
-        assert_eq!(terminal.visible_pixel(), first_pixels.get_pixel(0, 0).0);
-        assert_eq!(terminal.uploads, 1);
-
-        output.clear();
-        first.draw(&mut output, view(), 0, 400).unwrap();
-        terminal.apply(&output, true);
-        assert_eq!(terminal.visible_pixel(), first_pixels.get_pixel(0, 400).0);
-        assert_eq!(terminal.uploads, 1);
-
-        output.clear();
-        second.draw(&mut output, view(), 0, 480).unwrap();
-        terminal.apply(&output, true);
-        assert_eq!(terminal.visible_pixel(), second_pixels.get_pixel(0, 480).0);
-        assert_eq!(terminal.images.len(), 1);
-
-        output.clear();
-        clear(&mut output).unwrap();
+        assert!(first.upload(&mut output).unwrap());
+        assert!(second.upload(&mut output).unwrap());
         terminal.apply(&output, false);
         assert!(terminal.placements.is_empty());
-        assert_eq!(terminal.images.len(), 1);
-        output.clear();
-        second.draw(&mut output, view(), 0, 120).unwrap();
-        terminal.apply(&output, true);
-        assert_eq!(terminal.visible_pixel(), second_pixels.get_pixel(0, 120).0);
-        assert_eq!(terminal.uploads, 2);
+        assert_eq!(terminal.images.len(), 2);
+        assert!(
+            terminal.chunks > terminal.uploads,
+            "exercise chunk continuation"
+        );
+        assert_eq!(terminal.images[&first.id()], first_pixels);
+        assert_eq!(terminal.images[&second.id()], second_pixels);
 
         output.clear();
-        first.draw(&mut output, view(), 0, 240).unwrap();
-        terminal.apply(&output, true);
-        assert_eq!(terminal.visible_pixel(), first_pixels.get_pixel(0, 240).0);
-        assert_eq!(terminal.images.len(), 1);
-        assert_eq!(terminal.uploads, 3);
-
-        // The reported document at 250% decodes to more than Herdr's 32 MiB
-        // frame limit once base64 encoded. Its transport must be banded even
-        // when a large viewport needs the entire raster at once.
-        let mut pixels = tiny_skia::Pixmap::new(2000, 3735).unwrap();
-        let band_height = MAX_IMAGE_PIXELS / 2000;
-        for (row, data) in pixels.data_mut().chunks_exact_mut(2000 * 4).enumerate() {
-            for pixel in data.chunks_exact_mut(4) {
-                pixel.copy_from_slice(if row < band_height as usize {
-                    &[255, 0, 0, 255]
-                } else {
-                    &[0, 0, 255, 255]
-                });
+        first.place(&mut output, view(), 13, 243, 0, 13).unwrap();
+        second.place(&mut output, view(), 0, 237, 243, 13).unwrap();
+        finish_frame(&mut output, &[first.id(), second.id()]).unwrap();
+        terminal.apply(&output, false);
+        assert_eq!(
+            terminal.placements[&first.id()],
+            Placement {
+                source: (0, 13),
+                size: (64, 243),
+                cell: (1, 1),
+                offset: (5, 0),
             }
-        }
-        let banded = Frame::from_pixels(pixels).unwrap();
-        let large_view = Viewport {
-            width: 2000,
-            height: 2000,
-            ..view()
-        };
+        );
+        assert_eq!(
+            terminal.placements[&second.id()],
+            Placement {
+                source: (0, 0),
+                size: (64, 237),
+                cell: (1, 16),
+                offset: (5, 3),
+            }
+        );
+
         output.clear();
-        banded.draw(&mut output, large_view, 0, 1000).unwrap();
+        assert!(!first.upload(&mut output).unwrap());
+        assert!(!second.upload(&mut output).unwrap());
+        assert!(output.is_empty());
+        first.place(&mut output, view(), 30, 226, 0, 13).unwrap();
+        second.place(&mut output, view(), 0, 254, 226, 13).unwrap();
+        finish_frame(&mut output, &[first.id(), second.id()]).unwrap();
         terminal.apply(&output, true);
+        assert_eq!(terminal.uploads, 2);
+        assert_eq!(terminal.placements[&first.id()].source.1, 30);
+        assert_eq!(terminal.placements[&second.id()].size.1, 254);
+
+        // Ahead uploads preserve the canvas; replacements precede removals.
+        output.clear();
+        assert!(ahead.upload(&mut output).unwrap());
+        second.place(&mut output, view(), 0, 256, 0, 13).unwrap();
+        ahead.place(&mut output, view(), 0, 224, 256, 13).unwrap();
+        finish_frame(&mut output, &[second.id(), ahead.id()]).unwrap();
+        terminal.apply(&output, true);
+        assert_eq!(terminal.images.len(), 3);
+        assert_eq!(terminal.placements.len(), 2);
+        assert!(!terminal.placements.contains_key(&first.id()));
+
+        output.clear();
+        assert!(!first.upload(&mut output).unwrap());
+        first.place(&mut output, view(), 13, 243, 0, 13).unwrap();
+        second.place(&mut output, view(), 0, 237, 243, 13).unwrap();
+        finish_frame(&mut output, &[first.id(), second.id()]).unwrap();
+        ahead.release(&mut output).unwrap();
+        terminal.apply(&output, true);
+        assert_eq!(terminal.uploads, 3);
         assert_eq!(terminal.images.len(), 2);
-        assert_eq!(terminal.placements.len(), 2);
-        let mut bands: Vec<_> = terminal.placements.iter().collect();
-        bands.sort_by_key(|(id, _)| **id);
-        assert_eq!(*bands[0].1, (0, 1000, 2000, band_height - 1000));
-        assert_eq!(*bands[1].1, (0, 0, 2000, 3000 - band_height));
-        assert_eq!(
-            terminal.images[bands[0].0].get_pixel(0, 1000).0,
-            [255, 0, 0, 255]
-        );
-        assert_eq!(
-            terminal.images[bands[1].0].get_pixel(0, 0).0,
-            [0, 0, 255, 255]
-        );
-        let uploads = terminal.uploads;
+        assert!(terminal.images.contains_key(&first.id()));
+        assert!(terminal.images.contains_key(&second.id()));
+
         output.clear();
-        banded.draw(&mut output, large_view, 0, 0).unwrap();
+        first.release(&mut output).unwrap();
         terminal.apply(&output, true);
-        assert_eq!(terminal.placements.len(), 1);
+        assert_eq!(terminal.images.len(), 1);
+        assert!(terminal.images.contains_key(&second.id()));
         output.clear();
-        banded.draw(&mut output, large_view, 0, 1000).unwrap();
-        terminal.apply(&output, true);
-        assert_eq!(terminal.placements.len(), 2);
-        assert_eq!(terminal.uploads, uploads);
-        output.clear();
+        first.release(&mut output).unwrap();
+        assert!(output.is_empty(), "release is idempotent");
         clear(&mut output).unwrap();
         terminal.apply(&output, false);
         assert!(terminal.placements.is_empty());
-        assert_eq!(terminal.images.len(), 2);
-        output.clear();
-        first.draw(&mut output, view(), 0, 240).unwrap();
-        terminal.apply(&output, false);
         assert_eq!(terminal.images.len(), 1);
-        assert_eq!(terminal.visible_pixel(), first_pixels.get_pixel(0, 240).0);
-        UPLOADED_FRAME.store(0, Ordering::Relaxed);
+        output.clear();
+        assert!(!second.upload(&mut output).unwrap());
+        second.place(&mut output, view(), 0, 256, 0, 13).unwrap();
+        finish_frame(&mut output, &[second.id()]).unwrap();
+        terminal.apply(&output, false);
+        assert_eq!(terminal.uploads, 3);
+        assert_eq!(terminal.placements.len(), 1);
+        second.release(&mut Vec::new()).unwrap();
+    }
+
+    #[test]
+    fn small_strip_centers_without_scaling_and_preserves_pixel_offsets() {
+        let frame = Frame::from_pixels(tiny_skia::Pixmap::new(301, 201).unwrap()).unwrap();
+        let mut output = Vec::new();
+        frame.upload(&mut output).unwrap();
+        frame.place(&mut output, view(), 0, 201, 139, 249).unwrap();
+        let mut terminal = TerminalImages::default();
+        terminal.apply(&output, false);
+        assert_eq!(
+            terminal.placements[&frame.id()],
+            Placement {
+                source: (0, 0),
+                size: (301, 201),
+                cell: (31, 9),
+                offset: (1, 11),
+            }
+        );
+        frame.release(&mut Vec::new()).unwrap();
+    }
+
+    #[test]
+    fn exact_fit_and_oversized_intersections_never_reach_reserved_rows() {
+        let frame = Frame::from_pixels(tiny_skia::Pixmap::new(1200, 600).unwrap()).unwrap();
+        let mut output = Vec::new();
+        frame.upload(&mut output).unwrap();
+        frame
+            .place(&mut output, view(), 120, u32::MAX, 0, 0)
+            .unwrap();
+        let mut terminal = TerminalImages::default();
+        terminal.apply(&output, false);
+        assert_eq!(
+            terminal.placements[&frame.id()],
+            Placement {
+                source: (0, 120),
+                size: (800, 480),
+                cell: (0, 1),
+                offset: (0, 0),
+            }
+        );
+        output.clear();
+        frame
+            .place(&mut output, view(), 599, u32::MAX, 479, 799)
+            .unwrap();
+        terminal.apply(&output, true);
+        assert_eq!(
+            terminal.placements[&frame.id()],
+            Placement {
+                source: (0, 599),
+                size: (1, 1),
+                cell: (99, 30),
+                offset: (7, 15),
+            }
+        );
+        output.clear();
+        frame.place(&mut output, view(), u32::MAX, 1, 0, 0).unwrap();
+        frame.place(&mut output, view(), 0, 1, u32::MAX, 0).unwrap();
+        frame.place(&mut output, view(), 0, 1, 0, u32::MAX).unwrap();
+        assert!(output.is_empty());
+        frame.release(&mut Vec::new()).unwrap();
+    }
+
+    #[test]
+    fn placement_requires_an_explicit_upload() {
+        let (frame, _) = strip(4);
+        let mut output = Vec::new();
+        assert!(frame.place(&mut output, view(), 0, 256, 0, 0).is_err());
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn strip_dimensions_and_total_pixel_budget_are_bounded() {
+        assert!(
+            Frame::from_pixels(tiny_skia::Pixmap::new(MAX_IMAGE_DIMENSION + 1, 1).unwrap())
+                .is_err()
+        );
+        assert!(
+            Frame::from_pixels(tiny_skia::Pixmap::new(1, MAX_IMAGE_DIMENSION + 1).unwrap())
+                .is_err()
+        );
+        // The previously accepted whole 250% raster must be split by the caller.
+        assert!(Frame::from_pixels(tiny_skia::Pixmap::new(2000, 3735).unwrap()).is_err());
+        assert!(Frame::from_pixels(tiny_skia::Pixmap::new(2048, 2049).unwrap()).is_err());
+        assert!(Frame::from_pixels(tiny_skia::Pixmap::new(2048, 2048).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn png_upload_demultiplies_alpha() {
+        let mut pixels = tiny_skia::Pixmap::new(1, 1).unwrap();
+        pixels.data_mut().copy_from_slice(&[64, 32, 0, 128]);
+        let color = tiny_skia::PremultipliedColorU8::from_rgba(64, 32, 0, 128)
+            .unwrap()
+            .demultiply();
+        let frame = Frame::from_pixels(pixels).unwrap();
+        let mut output = Vec::new();
+        frame.upload(&mut output).unwrap();
+        let mut terminal = TerminalImages::default();
+        terminal.apply(&output, false);
+        assert_eq!(
+            terminal.images[&frame.id()].get_pixel(0, 0).0,
+            [color.red(), color.green(), color.blue(), color.alpha()]
+        );
+        frame.release(&mut Vec::new()).unwrap();
     }
 }

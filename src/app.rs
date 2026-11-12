@@ -3,6 +3,12 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, Sender},
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -17,9 +23,15 @@ use crossterm::{
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
-    graphics::{self, Frame, TerminalGuard, Viewport},
+    graphics::{self, TerminalGuard, Viewport},
     render::{self, Document, RenderOptions},
 };
+
+#[path = "raster_cache.rs"]
+mod raster_cache;
+use raster_cache::StripCache;
+
+static NEXT_DOCUMENT: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct Position {
@@ -72,6 +84,13 @@ impl SmoothScroll {
         before != *position
     }
 
+    fn next_position(&self, position: u32) -> Option<u32> {
+        let target = self.target?;
+        let remaining = i64::from(target) - i64::from(position);
+        let step = remaining.unsigned_abs().div_ceil(4) as i64 * remaining.signum();
+        Some((i64::from(position) + step) as u32)
+    }
+
     fn advance(&mut self, position: &mut u32, now: Instant) -> bool {
         let Some(target) = self.target else {
             return false;
@@ -80,13 +99,13 @@ impl SmoothScroll {
             return false;
         }
         self.tick = now;
-        let remaining = i64::from(target) - i64::from(*position);
-        let step = remaining.unsigned_abs().div_ceil(4) as i64 * remaining.signum();
-        *position = (i64::from(*position) + step) as u32;
+        let next = self.next_position(*position).unwrap();
+        let changed = next != *position;
+        *position = next;
         if *position == target {
             self.cancel();
         }
-        step != 0
+        changed
     }
 
     fn wait(&self, now: Instant) -> Duration {
@@ -114,54 +133,56 @@ fn zoom_percent(ppi: u32) -> u32 {
     (f64::from(ppi) * 100.0 / 96.0).round() as u32
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FrameKey {
-    position: Position,
-    width: u32,
-    height: u32,
-    ppi: u32,
-    viewport_width: u32,
-    viewport_height: u32,
+enum Wake {
+    Input(io::Result<Event>),
+    Raster,
 }
 
-impl FrameKey {
-    fn region(position: Position, width: u32, height: u32, ppi: u32, view: Viewport) -> Self {
-        let region_width = view.width.min(width.saturating_sub(position.x));
-        // Keep decoded relay assets small, not merely their compressed PNGs.
-        // A viewport larger than this budget is split into transport tiles.
-        let cache_height = (graphics::MAX_IMAGE_PIXELS / region_width.max(1)).max(view.height);
-        let region_height = view
-            .height
-            .saturating_mul(3)
-            .min(height)
-            .min(graphics::MAX_IMAGE_DIMENSION)
-            .min(cache_height);
-        Self {
-            position: Position {
-                x: position.x,
-                y: position
-                    .y
-                    .saturating_sub(region_height.saturating_sub(view.height) / 2)
-                    .min(height.saturating_sub(region_height)),
-            },
-            width: region_width,
-            height: region_height,
-            ppi,
-            viewport_width: view.width,
-            viewport_height: view.height,
-        }
-    }
+// Crossterm's blocking reader and the raster worker share one wakeable event queue.
+// Only this reader touches Crossterm input; shutting down never leaves a reader behind.
+struct InputReader {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
 
-    fn contains(self, position: Position, document_height: u32, ppi: u32, view: Viewport) -> bool {
-        self.ppi == ppi
-            && self.viewport_width == view.width
-            && self.viewport_height == view.height
-            && self.position.x == position.x
-            && self.position.y <= position.y
-            && position
-                .y
-                .saturating_add(view.height.min(document_height.saturating_sub(position.y)))
-                <= self.position.y.saturating_add(self.height)
+impl InputReader {
+    fn start(sender: Sender<Wake>) -> Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let thread = thread::Builder::new()
+            .name("mdterm-input".into())
+            .spawn(move || {
+                while !stopping.load(Ordering::Relaxed) {
+                    match event::poll(Duration::from_millis(100)) {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            let event = event::read();
+                            let failed = event.is_err();
+                            if sender.send(Wake::Input(event)).is_err() || failed {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = sender.send(Wake::Input(Err(error)));
+                            break;
+                        }
+                    }
+                }
+            })
+            .context("cannot start terminal input reader")?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for InputReader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -169,11 +190,13 @@ impl FrameKey {
 struct Performance {
     render: Duration,
     encode: Duration,
+    upload: Duration,
+    blocking: Duration,
     output: Duration,
     cache_hit: bool,
 }
 
-// Keep Frame::draw's flush inside the enclosing synchronized update.
+// Keep placement output inside the enclosing synchronized update.
 struct FrameOutput<'a, W>(&'a mut W);
 
 impl<W: Write> Write for FrameOutput<'_, W> {
@@ -191,11 +214,11 @@ impl<W: Write> Write for FrameOutput<'_, W> {
 }
 
 struct Tab {
-    document: Document,
+    document: Arc<Document>,
+    generation: u64,
     position: Position,
     back: Vec<Position>,
     forward: Vec<Position>,
-    frame: Option<(FrameKey, Frame)>,
     options: RenderOptions,
     base_ppi: u32,
     fit_width: bool,
@@ -217,11 +240,11 @@ impl Tab {
             },
         )?;
         Ok(Self {
-            document,
+            document: Arc::new(document),
+            generation: NEXT_DOCUMENT.fetch_add(1, Ordering::Relaxed),
             position: Position::default(),
             back: vec![],
             forward: vec![],
-            frame: None,
             base_ppi: options.ppi,
             options,
             fit_width: false,
@@ -230,31 +253,6 @@ impl Tab {
             matches: vec![],
             match_index: 0,
         })
-    }
-
-    fn prepare_frame(&mut self, view: Viewport) -> Result<Performance> {
-        let (width, height) = self.document.dimensions(self.options.ppi);
-        let mut performance = Performance::default();
-        if self.frame.as_ref().is_none_or(|(cached, _)| {
-            !cached.contains(self.position, height, self.options.ppi, view)
-        }) {
-            let key = FrameKey::region(self.position, width, height, self.options.ppi, view);
-            let raster = self.document.rasterize(
-                key.ppi,
-                key.position.x,
-                key.position.y,
-                key.width,
-                key.height,
-            )?;
-            performance.render = raster.render_elapsed;
-            let encode_started = Instant::now();
-            let frame = Frame::from_pixels(raster.pixels)?;
-            performance.encode = encode_started.elapsed();
-            self.frame = Some((key, frame));
-        } else {
-            performance.cache_hit = true;
-        }
-        Ok(performance)
     }
 
     fn navigate(&mut self, next: Position) {
@@ -333,9 +331,9 @@ impl Tab {
         )?;
         // Do not replace the usable document or its options on a failed render.
         self.stamp = source_stamp;
-        self.document = document;
+        self.document = Arc::new(document);
+        self.generation = NEXT_DOCUMENT.fetch_add(1, Ordering::Relaxed);
         self.options.dark = dark;
-        self.frame = None;
         self.search(self.query.clone());
         Ok(())
     }
@@ -353,7 +351,7 @@ impl Tab {
             position.y = (f64::from(position.y) * ratio).round() as u32;
         }
         self.options.ppi = ppi;
-        self.frame = None;
+        self.generation = NEXT_DOCUMENT.fetch_add(1, Ordering::Relaxed);
     }
 
     fn fit(&mut self, view: Viewport) {
@@ -466,6 +464,7 @@ struct App {
     scroll: SmoothScroll,
     performance: Option<Performance>,
     show_performance: bool,
+    cache: StripCache,
 }
 
 impl App {
@@ -495,7 +494,19 @@ impl App {
             self.scroll.cancel();
             return false;
         };
-        self.scroll.advance(&mut tab.position.y, now)
+        let before = tab.position.y;
+        let target = self.scroll.target;
+        if !self.scroll.advance(&mut tab.position.y, now) {
+            return false;
+        }
+        if !self.cache.ready_at(tab.position.x, tab.position.y) {
+            // Never advance into a hole or reverse from an unseen position.
+            // Prefetch covers the next step; completion wakes the event loop.
+            tab.position.y = before;
+            self.scroll.target = target;
+            return false;
+        }
+        true
     }
 
     fn open(&mut self, path: &Path) -> Result<()> {
@@ -987,28 +998,63 @@ impl App {
         Ok(())
     }
 
-    fn draw(&mut self, out: &mut impl Write, view: Viewport) -> Result<()> {
+    fn prepare(&mut self, out: &mut impl Write, view: Viewport) -> Result<bool> {
+        let started = Instant::now();
         let popup = matches!(self.mode, Mode::List(_) | Mode::Help(_));
-        // Rasterization/encoding can exceed the terminal's synchronized-update timeout.
-        // Finish them before starting output, leaving the previous image visible.
-        self.performance = if let Some(tab) = self.tab() {
+        if let Some(tab) = self
+            .tabs
+            .get_mut(self.active)
+            .filter(|_| !popup && view.width > 0 && view.height > 0 && view.rows > view.top + 1)
+        {
             tab.fit(view);
-            if !popup && view.width > 0 && view.height > 0 && view.rows > view.top + 1 {
-                Some(tab.prepare_frame(view)?)
-            } else {
-                None
+            let direction =
+                self.scroll
+                    .target
+                    .map_or(0, |target| match target.cmp(&tab.position.y) {
+                        std::cmp::Ordering::Less => -1,
+                        std::cmp::Ordering::Equal => 0,
+                        std::cmp::Ordering::Greater => 1,
+                    });
+            self.cache.request(
+                &tab.document,
+                tab.generation,
+                tab.options.ppi,
+                tab.position.x,
+                tab.position.y,
+                view,
+                direction,
+                self.scroll.next_position(tab.position.y),
+            );
+            let work = self.cache.service(out)?;
+            let performance = self.performance.get_or_insert_with(Performance::default);
+            if work.completed {
+                performance.render = work.render;
+                performance.encode = work.encode;
             }
+            performance.upload = work.upload;
+            performance.cache_hit = self.cache.ready_at(tab.position.x, tab.position.y);
+            performance.blocking = started.elapsed();
+            Ok(self.cache.changed())
         } else {
-            None
-        };
+            self.cache.cancel();
+            self.cache.prune(out)?;
+            self.performance = None;
+            Ok(false)
+        }
+    }
+
+    fn draw(&mut self, out: &mut impl Write, view: Viewport) -> Result<()> {
+        // Worker raster/PNG work and prepare() uploads finish outside synchronized
+        // output, so a slow strip cannot expire the terminal's update transaction.
         out.write_all(b"\x1b[?2026h")?;
         let started = Instant::now();
         let result = self.draw_inner(&mut FrameOutput(out), view);
         let end = out.write_all(b"\x1b[?2026l").and_then(|()| out.flush());
+        result.and(end.map_err(Into::into))?;
+        self.cache.prune(out)?;
         if let Some(performance) = &mut self.performance {
             performance.output = started.elapsed();
         }
-        result.and(end.map_err(Into::into))?;
         // Report the completed image output, including its actual flush, not terminal latency.
         out.write_all(b"\x1b[?2026h")?;
         let result = self.draw_status(out, view);
@@ -1037,17 +1083,16 @@ impl App {
         } else {
             if let Some(tab) = self.tabs.get(self.active) {
                 if view.width > 0 && view.height > 0 && view.rows > view.top + 1 {
-                    // ED2 also deletes Kitty graphics. Only text rows may be erased here.
-                    for row in view.top..view.rows.saturating_sub(1) {
-                        queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+                    if self.cache.ready_at(tab.position.x, tab.position.y) {
+                        // ED2 also deletes Kitty graphics. Erase text only, then replace
+                        // the complete visible strip set in one synchronized update.
+                        for row in view.top..view.rows.saturating_sub(1) {
+                            queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+                        }
+                        self.cache.place(out, view)?;
                     }
-                    let (key, frame) = tab.frame.as_ref().unwrap();
-                    frame.draw(
-                        out,
-                        view,
-                        tab.position.x - key.position.x,
-                        tab.position.y - key.position.y,
-                    )?;
+                    // Jumps/reloads retain the previous complete view until every new
+                    // visible strip is ready; partial viewports are never placed.
                 } else {
                     graphics::clear(out)?;
                 }
@@ -1164,9 +1209,10 @@ impl App {
                         segment(
                             out,
                             &format!(
-                                "  render {:.1}ms  encode {:.1}ms  output {:.1}ms{cache}",
+                                "  bg render {:.1}ms  bg PNG {:.1}ms  upload {:.1}ms  output {:.1}ms{cache}",
                                 performance.render.as_secs_f64() * 1000.0,
                                 performance.encode.as_secs_f64() * 1000.0,
+                                performance.upload.as_secs_f64() * 1000.0,
                                 performance.output.as_secs_f64() * 1000.0,
                             ),
                             &mut remaining,
@@ -1176,9 +1222,7 @@ impl App {
                             out,
                             &format!(
                                 "  frame {:.1}ms{cache}",
-                                (performance.render + performance.encode + performance.output)
-                                    .as_secs_f64()
-                                    * 1000.0,
+                                (performance.blocking + performance.output).as_secs_f64() * 1000.0,
                             ),
                             &mut remaining,
                         )?;
@@ -1632,6 +1676,8 @@ fn decode(text: &str) -> Result<String> {
 }
 
 pub fn run(paths: Vec<PathBuf>, options: RenderOptions) -> Result<()> {
+    let (sender, events) = mpsc::channel();
+    let raster_sender = sender.clone();
     let mut app = App {
         tabs: vec![],
         active: 0,
@@ -1642,6 +1688,9 @@ pub fn run(paths: Vec<PathBuf>, options: RenderOptions) -> Result<()> {
         scroll: SmoothScroll::new(Instant::now()),
         performance: None,
         show_performance: false,
+        cache: StripCache::new(move || {
+            let _ = raster_sender.send(Wake::Raster);
+        })?,
     };
     for path in paths {
         app.tabs.push(Tab::open(
@@ -1657,20 +1706,33 @@ pub fn run(paths: Vec<PathBuf>, options: RenderOptions) -> Result<()> {
     }
     let mut view = graphics::viewport(u16::from(app.tabs.len() > 1))?;
     let _guard = TerminalGuard::enter()?;
+    let _input = InputReader::start(sender)?;
     let mut out = io::stdout();
     let mut dirty = true;
     let mut last_check = Instant::now();
     while !app.quitting {
+        let top = u16::from(app.tabs.len() > 1);
+        if view.top != top {
+            view = graphics::viewport(top)?;
+        }
+        dirty |= app.prepare(&mut out, view)?;
         if dirty {
-            let top = u16::from(app.tabs.len() > 1);
-            if view.top != top {
-                view = graphics::viewport(top)?;
-            }
             app.draw(&mut out, view)?;
             dirty = false;
         }
-        if event::poll(app.scroll.wait(Instant::now()))? {
-            let result = match event::read()? {
+        let wait = if app.cache.pending_upload() {
+            // Each immediate pass uploads one ready strip; never spin awaiting a worker.
+            Duration::ZERO
+        } else {
+            app.scroll.wait(Instant::now())
+        };
+        let wake = match events.recv_timeout(wait) {
+            Ok(wake) => Some(wake),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => bail!("terminal input stopped"),
+        };
+        if let Some(Wake::Input(input)) = wake {
+            let result = match input? {
                 Event::Key(key) => app.key(key, view),
                 Event::Resize(_, _) => {
                     app.scroll.cancel();
@@ -1726,16 +1788,6 @@ pub fn run(paths: Vec<PathBuf>, options: RenderOptions) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn scroll_view() -> Viewport {
-        Viewport {
-            columns: 80,
-            rows: 26,
-            top: 0,
-            width: 800,
-            height: 500,
-        }
-    }
 
     #[test]
     fn smooth_scroll_accumulates_and_advances_only_when_due() {
@@ -1833,82 +1885,6 @@ mod tests {
         assert!(!scroll.advance(&mut position, now + SCROLL_FRAME * 10));
         assert!(scroll.advance(&mut position, now + SCROLL_FRAME * 11));
         assert_eq!(position, 875);
-    }
-
-    #[test]
-    fn overscan_cache_is_bounded_and_contains_visible_scroll_positions() {
-        let view = scroll_view();
-        let origin = Position { x: 50, y: 2000 };
-        let key = FrameKey::region(origin, 2000, 10000, 240, view);
-        assert_eq!(key.position, Position { x: 50, y: 1500 });
-        assert_eq!((key.width, key.height), (800, 1500));
-        assert!(key.contains(origin, 10000, 240, view));
-        assert!(key.contains(Position { x: 50, y: 2500 }, 10000, 240, view));
-        assert!(!key.contains(Position { x: 50, y: 2501 }, 10000, 240, view));
-        assert!(!key.contains(Position { x: 50, y: 1499 }, 10000, 240, view));
-        assert!(!key.contains(Position { x: 51, y: 2000 }, 10000, 240, view));
-        assert!(!key.contains(origin, 10000, 192, view));
-        assert!(!key.contains(origin, 10000, 240, Viewport { width: 801, ..view }));
-        assert!(!key.contains(
-            origin,
-            10000,
-            240,
-            Viewport {
-                height: 501,
-                ..view
-            }
-        ));
-    }
-
-    #[test]
-    fn overscan_cache_handles_document_edges_and_short_documents() {
-        let view = scroll_view();
-        for (height, y, expected_y, expected_height) in [
-            (10000, 0, 0, 1500),
-            (10000, 9500, 8500, 1500),
-            (200, 0, 0, 200),
-        ] {
-            let position = Position { x: 0, y };
-            let key = FrameKey::region(position, 300, height, 240, view);
-            assert_eq!(key.position.y, expected_y);
-            assert_eq!(key.height, expected_height);
-            assert_eq!(key.width, 300);
-            assert!(key.height <= view.height * 3);
-            assert!(key.position.y + key.height <= height);
-            assert!(key.contains(position, height, 240, view));
-        }
-    }
-
-    #[test]
-    fn high_zoom_overscan_respects_terminal_limit_without_losing_visible_region() {
-        for (viewport_width, viewport_height) in [
-            (800, 4000),
-            (800, 6000),
-            (800, 10000),
-            (2000, 1972),
-            (2400, 2400),
-        ] {
-            let view = Viewport {
-                width: viewport_width,
-                height: viewport_height,
-                ..scroll_view()
-            };
-            for height in [9999u32, 10000, 10001, 20000, 30000] {
-                let maximum = height.saturating_sub(view.height);
-                for y in [0, maximum / 2, maximum] {
-                    let position = Position { x: 0, y };
-                    let key = FrameKey::region(position, 2400, height, 240, view);
-                    assert!(key.height <= graphics::MAX_IMAGE_DIMENSION);
-                    assert!(
-                        key.width * key.height <= graphics::MAX_IMAGE_PIXELS
-                            || key.height == height.min(view.height),
-                        "overscan exceeded the decoded pixel budget"
-                    );
-                    assert!(key.position.y + key.height <= height);
-                    assert!(key.contains(position, height, 240, view));
-                }
-            }
-        }
     }
 
     #[test]
