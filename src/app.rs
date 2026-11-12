@@ -360,7 +360,7 @@ impl Tab {
             let ppi = (f64::from(self.options.ppi) * f64::from(view.width)
                 / f64::from(width.max(1)))
             .floor()
-            .clamp(36.0, 288.0) as u32;
+            .clamp(36.0, 576.0) as u32;
             self.zoom(ppi);
         }
         self.clamp(view);
@@ -977,7 +977,7 @@ impl App {
                             KeyCode::Char('-') => (tab.options.ppi as f64 / 1.25).round() as u32,
                             _ => (tab.options.ppi as f64 * 1.25).round() as u32,
                         }
-                        .clamp(36, 288);
+                        .clamp(36, 576);
                         tab.zoom(ppi);
                         tab.fit_width = false;
                     }

@@ -730,10 +730,10 @@ mod tests {
             entries: Vec::new(),
             tree,
         };
-        // Visit far-apart regions and then jump back, at both native and
-        // startup resolutions. Neither a full-document pixmap nor cache reuse
+        // Visit far-apart regions and then jump back, at native, startup, and
+        // maximum resolutions. Neither a full-document pixmap nor cache reuse
         // may affect the coordinates passed into resvg's clip transforms.
-        for ppi in [72, 240] {
+        for ppi in [72, 240, 576] {
             let scale = ppi / 24;
             for y in [50024, 24, 150024, 50024] {
                 let raster = document

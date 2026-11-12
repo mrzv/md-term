@@ -35,7 +35,7 @@ cat README.md | mdterm --export stdin.png
 
 With no file arguments, piped stdin is read through EOF. Use `-` to select stdin explicitly, at most once. Keyboard controls still use the controlling terminal. Stdin opens as a private snapshot named `stdin`; relative images and Markdown links resolve from the working directory.
 
-`--export` renders the entire continuous document without a terminal and refuses to overwrite an existing file. It requires exactly one input and allocates a full-document bitmap, unlike interactive viewing. `--ppi` accepts 36–288 (default 240, or 250% zoom; 96 PPI is 100%). Dark rendering is the default.
+`--export` renders the entire continuous document without a terminal and refuses to overwrite an existing file. It requires exactly one input and allocates a full-document bitmap, unlike interactive viewing. `--ppi` accepts 36–576 (default 240, or 250% zoom; 96 PPI is 100%). Dark rendering is the default.
 
 ## Controls
 
@@ -82,7 +82,7 @@ Use `$E = mc^2$` for inline math and `$$...$$` on separate lines for display mat
 ## Rendering boundaries
 
 - Search, outline, and heading-fragment navigation jump to text-block coordinates; matches are not highlighted.
-- Zoom changes raster resolution, not document layout. Fit-width is bounded by the 36–288 PPI range.
+- Zoom changes raster resolution, not document layout. Keyboard zoom and fit-width share the 36–576 PPI range (up to 600%).
 - Local images are copied into a private rendering directory. Relative paths use the source file's directory, or the working directory for stdin. Remote/data images are not fetched and become descriptive text.
 - Local Markdown links (including heading fragments) open in new tabs. Heading fragments within the current document stay in that tab. Explicitly selected HTTP(S)/mailto links use the system opener. Other schemes and non-Markdown file links are rejected.
 - Source metadata, raw HTML, and styling attributes are not used as executable layout instructions. Raw Typst/TeX blocks are displayed as code. Unsupported math follows Pandoc's conversion behavior. Code blocks are monospaced without syntax highlighting.

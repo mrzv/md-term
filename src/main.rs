@@ -22,7 +22,7 @@ struct Args {
     #[arg(long)]
     light: bool,
     /// Raster resolution (96 PPI = 100%); defaults to 250% zoom.
-    #[arg(long, default_value_t = 240, value_parser = clap::value_parser!(u32).range(36..=288))]
+    #[arg(long, default_value_t = 240, value_parser = clap::value_parser!(u32).range(36..=576))]
     ppi: u32,
     /// Render the full continuous document to a new PNG without terminal mode.
     #[arg(long, value_name = "PNG")]
