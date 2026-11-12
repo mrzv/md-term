@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -11,9 +12,13 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::config::{Color, Markup};
+
+#[derive(Clone)]
 pub struct RenderOptions {
     pub dark: bool,
     pub ppi: u32,
+    pub markup: Arc<Markup>,
 }
 
 pub struct Entry {
@@ -148,11 +153,18 @@ const PREAMBLE: &str = r##"
 #set smartquote(enabled: false)
 #set terms(hanging-indent: 1.5em)
 #set table(inset: 5pt, stroke: 0.4pt + md-muted)
+#let md-color(color, body) = if color == none { body } else { text(fill: color, body) }
+#show raw.where(block: false): it => md-color(md-inline-code, it)
+#show strong: it => md-color(md-strong, it)
+#show emph: it => md-color(md-emphasis, it)
+#show heading: it => md-color(md-heading, it)
+#show strike: it => md-color(md-strike, it)
+#show quote.where(block: false): it => md-color(md-quote, it)
 #show raw.where(block: true): it => block(
   width: 100%, inset: 9pt, radius: 3pt, fill: md-code-background, it,
 )
 #show quote.where(block: true): it => block(
-  inset: (left: 10pt), stroke: (left: 2pt + md-muted), it,
+  inset: (left: 10pt), stroke: (left: 2pt + md-muted), md-color(md-quote, it),
 )
 #let divider() = line(length: 100%, stroke: 0.5pt + md-muted)
 #let md-entry(text, level, target, id) = context {
@@ -227,22 +239,22 @@ pub fn render(source: Arc<Source>, options: RenderOptions) -> Result<Document> {
     fs::write(work.path().join("code.tmTheme"), code_theme(options.dark))
         .context("cannot write syntax highlighting theme")?;
     let palette = if options.dark {
-        ["#1e2030", "#c8d3f5", "#222436", "#636da6", "#82aaff"]
+        ["#1e2030", "#c8d3f5", "#222436", "#636da6"]
     } else {
-        ["#ffffff", "#24292f", "#f3f4f6", "#9ca3af", "#0969da"]
+        ["#ffffff", "#24292f", "#f3f4f6", "#9ca3af"]
     };
     let mut typst_source = String::new();
-    for (name, color) in [
-        "background",
-        "foreground",
-        "code-background",
-        "muted",
-        "link",
-    ]
-    .into_iter()
-    .zip(palette)
+    for (name, color) in ["background", "foreground", "code-background", "muted"]
+        .into_iter()
+        .zip(palette)
     {
         typst_source.push_str(&format!("#let md-{name} = rgb(\"{color}\")\n"));
+    }
+    for (name, color) in options.markup.colors(options.dark) {
+        match color {
+            Color::Inherit => writeln!(typst_source, "#let md-{name} = none")?,
+            Color::Rgb(rgb) => writeln!(typst_source, "#let md-{name} = rgb(\"#{rgb:06x}\")")?,
+        }
     }
     typst_source.push_str(PREAMBLE);
     typst_source.push_str(&body);
@@ -467,7 +479,7 @@ impl Sanitizer<'_> {
                 inlines.insert(
                     0,
                     raw_inline(&format!(
-                        "{}#text(fill: md-link)[",
+                        "{}#md-color(md-link)[",
                         marker(&text, None, target.as_deref(), None)
                     )),
                 );

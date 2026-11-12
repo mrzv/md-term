@@ -232,13 +232,7 @@ impl Tab {
     fn open(source: Arc<Source>, options: RenderOptions) -> Result<Self> {
         // Associate the rendering with the version Pandoc is about to read.
         let stamp = stamp(&source);
-        let document = render::render(
-            source,
-            RenderOptions {
-                dark: options.dark,
-                ppi: options.ppi,
-            },
-        )?;
+        let document = render::render(source, options.clone())?;
         Ok(Self {
             document: Arc::new(document),
             generation: NEXT_DOCUMENT.fetch_add(1, Ordering::Relaxed),
@@ -327,6 +321,7 @@ impl Tab {
             RenderOptions {
                 dark,
                 ppi: self.options.ppi,
+                markup: Arc::clone(&self.options.markup),
             },
         )?;
         // Do not replace the usable document or its options on a failed render.
@@ -513,16 +508,10 @@ impl App {
     }
 
     fn open(&mut self, path: &Path) -> Result<()> {
-        let options = self.tabs.get(self.active).map_or(
-            RenderOptions {
-                dark: self.defaults.dark,
-                ppi: self.defaults.ppi,
-            },
-            |tab| RenderOptions {
-                dark: tab.options.dark,
-                ppi: tab.options.ppi,
-            },
-        );
+        let options = self
+            .tabs
+            .get(self.active)
+            .map_or_else(|| self.defaults.clone(), |tab| tab.options.clone());
         let tab = Tab::open(Arc::new(Source::file(path)?), options)?;
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -1686,13 +1675,7 @@ pub fn run(sources: Vec<Arc<Source>>, options: RenderOptions) -> Result<()> {
         })?,
     };
     for source in sources {
-        app.tabs.push(Tab::open(
-            source,
-            RenderOptions {
-                dark: app.defaults.dark,
-                ppi: app.defaults.ppi,
-            },
-        )?);
+        app.tabs.push(Tab::open(source, app.defaults.clone())?);
     }
     if app.tabs.is_empty() {
         app.browse(Path::new("."))?;

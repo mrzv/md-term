@@ -29,6 +29,7 @@ mdterm - < README.md            # explicitly select stdin
 mdterm notes.md - < README.md   # mix file and stdin tabs
 mdterm --light book.md
 mdterm --ppi 120 book.md
+mdterm --config colors.toml book.md
 mdterm --export document.png README.md
 cat README.md | mdterm --export stdin.png
 ```
@@ -89,7 +90,33 @@ fn main() {
 }
 ```
 
-Highlighting uses Typst's bundled language definitions and follows the dark/light theme (`i`). Untagged blocks and unsupported languages remain plain monospaced text; inline code is unchanged. Code remains searchable as its original text. Highlighting happens during layout, not scrolling or zoom.
+Highlighting uses Typst's bundled language definitions and follows the dark/light theme (`i`). Untagged blocks and unsupported languages remain plain monospaced text. Code remains searchable as its original text. Highlighting happens during layout, not scrolling or zoom.
+
+## Markup colors
+
+Inline code, bold, italics, headings, links, block quotes, and strikethrough use colors matched to the document's dark/light theme. Formatting and search remain unchanged; coloring happens during layout.
+
+On startup, mdterm creates `$XDG_CONFIG_HOME/mdterm/config.toml`, or `~/.config/mdterm/config.toml` when `XDG_CONFIG_HOME` is unset. The generated file contains both complete palettes. Use `--config colors.toml` to read a different existing file instead. Configuration is read at startup; restart mdterm after editing it.
+
+For example, a partial configuration can override just these colors:
+
+```toml
+[markup]
+enabled = true
+
+[markup.dark]
+inline_code = "#c3e88d"
+strong = "#ff966c"
+emphasis = "inherit"
+
+[markup.light]
+inline_code = "#0a3069"
+strong = "#cf222e"
+```
+
+Both `[markup.dark]` and `[markup.light]` accept `inline_code`, `strong`, `emphasis`, `heading`, `link`, `quote`, and `strike`. Missing entries use that theme's defaults. Values are `"#RRGGBB"` or `"inherit"` to keep the surrounding text color, including inside another styled element.
+
+Set `[markup] enabled = false` to disable markup colors while preserving bold, italic, monospaced, and other formatting. Code-block syntax highlighting is independent and remains enabled.
 
 ## Rendering boundaries
 

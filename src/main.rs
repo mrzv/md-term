@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod graphics;
 mod render;
 
@@ -18,6 +19,9 @@ struct Args {
     /// Markdown documents to open in tabs; use - for stdin.
     /// With no files, read piped stdin or browse the current directory.
     files: Vec<PathBuf>,
+    /// Read an alternate TOML configuration instead of the default config.
+    #[arg(long, value_name = "TOML")]
+    config: Option<PathBuf>,
     /// Use light document colors instead of dark colors.
     #[arg(long)]
     light: bool,
@@ -31,6 +35,7 @@ struct Args {
 
 fn run() -> Result<()> {
     let mut args = Args::parse();
+    let config = config::Config::load(args.config.as_deref())?;
     if args.files.is_empty() && !io::stdin().is_terminal() {
         args.files.push(PathBuf::from("-"));
     }
@@ -66,6 +71,7 @@ fn run() -> Result<()> {
     let options = render::RenderOptions {
         dark: !args.light,
         ppi: args.ppi,
+        markup: Arc::new(config.markup),
     };
     if let Some(output) = args.export {
         return render::export(sources.pop().unwrap(), &output, options);

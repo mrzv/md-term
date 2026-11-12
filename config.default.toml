@@ -1,0 +1,24 @@
+# Set enabled to false to keep document formatting without markup colors.
+# Code-block syntax highlighting is independent of these settings.
+[markup]
+enabled = true
+
+# Colors accept #RRGGBB or "inherit" to keep the surrounding text color.
+# Missing entries use the built-in palette for the selected dark/light theme.
+[markup.dark]
+inline_code = "#c3e88d"
+strong = "#ff966c"
+emphasis = "#c099ff"
+heading = "#82aaff"
+link = "#86e1fc"
+quote = "#828bb8"
+strike = "#828bb8"
+
+[markup.light]
+inline_code = "#0a3069"
+strong = "#cf222e"
+emphasis = "#8250df"
+heading = "#0550ae"
+link = "#0969da"
+quote = "#6e7781"
+strike = "#6e7781"
